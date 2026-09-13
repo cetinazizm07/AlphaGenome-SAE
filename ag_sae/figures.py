@@ -408,6 +408,394 @@ def figure_specificity(
 
 
 # --------------------------------------------------------------------------
+# Figure 5 - reconstruction quality across runs
+# --------------------------------------------------------------------------
+
+
+def _spread_labels(anchors, gap: float):
+    """Push label anchors apart vertically so none of them overprint.
+
+    Takes [x, y, payload] rows, returns them with y adjusted. Runs that land on
+    the same point would otherwise stack their labels into an unreadable blob.
+    """
+    ordered = sorted(anchors, key=lambda row: row[1])
+    for lower, upper in zip(ordered, ordered[1:]):
+        if upper[1] - lower[1] < gap:
+            upper[1] = lower[1] + gap
+    return ordered
+
+
+def figure_pareto(runs: pd.DataFrame, out: str | Path, *, title: str = "") -> list[Path]:
+    """Reconstruction against sparsity, one mark per training run.
+
+    Two layouts, chosen from the data. If `mean_l0` varies the runs form a
+    sparsity sweep and the figure is a true trade-off plot with the
+    non-dominated frontier drawn. If `mean_l0` is the same everywhere, TopK
+    pinned it to k and a trade-off plot would be a vertical stripe, so the x
+    axis becomes depth instead and the fixed sparsity is stated on the panel.
+
+    Colour separates conv from tower only. Six taps exceed the categorical
+    slots, so tap identity comes from the axis and its label.
+    """
+    import matplotlib.pyplot as plt
+
+    required = {"tap", "seed", "mean_l0", "fvu"}
+    missing = required - set(runs.columns)
+    if missing:
+        raise ValueError(f"runs is missing {sorted(missing)}")
+    if runs.empty:
+        raise ValueError("No runs to plot")
+
+    use_style()
+    table = runs.copy()
+    table["tap"] = pd.Categorical(table.tap, categories=[t for t in TAP_ORDER
+                                                        if t in set(table.tap)],
+                                  ordered=True)
+    table = table.sort_values(["tap", "seed"])
+    taps = list(table.tap.cat.categories)
+    l0 = table.mean_l0.to_numpy(dtype=float)
+    swept = bool(l0.size and (l0.max() - l0.min()) > 1e-6 * max(1.0, abs(l0.max())))
+
+    fig, ax = plt.subplots(figsize=(4.2, 3.0))
+    # Classify by which tap it is, not where it sits in this subset. Passing
+    # only the tower taps must not colour them as convolutional.
+    conv = frozenset(TAP_ORDER[:N_CONV_TAPS])
+    colour = {t: (SERIES[0] if t in conv else SERIES[1]) for t in taps}
+    boundary = sum(1 for t in taps if t in conv)
+
+    if swept:
+        anchors = []
+        for tap in taps:
+            sub = table[table.tap == tap].sort_values("mean_l0")
+            ax.plot(sub.mean_l0, sub.fvu, "-o", color=colour[tap], markersize=4,
+                    linewidth=1.2, markeredgewidth=0, zorder=3, alpha=0.9)
+            end = sub.iloc[-1]
+            anchors.append([float(end.mean_l0), float(end.fvu), tap])
+        for x, y, tap in _spread_labels(anchors, gap=0.045):
+            ax.annotate(TAP_LABEL.get(tap, tap), (x, y), xytext=(6, 0),
+                        textcoords="offset points", fontsize=7,
+                        color=colour[tap], va="center")
+        # Frontier: the runs that nothing else beats on both axes at once.
+        order = table.sort_values("mean_l0")
+        keep, floor = [], np.inf
+        for row in order.itertuples(index=False):
+            if row.fvu < floor:
+                keep.append((row.mean_l0, row.fvu))
+                floor = row.fvu
+        if len(keep) > 1:
+            ax.step(*zip(*keep), where="post", color=INK_MUTED, linewidth=1.0,
+                    linestyle=(0, (3, 3)), zorder=2)
+        ax.set_xlabel("Mean L0 (active features per bin)")
+        note = "dashed line: non-dominated runs"
+    else:
+        positions = {t: i for i, t in enumerate(taps)}
+        # Seeds usually land within a hair of each other, so nudge them apart.
+        # Without this the three runs print as one blob and the spread, which
+        # is the reason for training three seeds, becomes invisible.
+        seed_values = sorted(table.seed.unique())
+        nudge = {s: (i - (len(seed_values) - 1) / 2) * 0.13
+                 for i, s in enumerate(seed_values)}
+        for tap in taps:
+            sub = table[table.tap == tap]
+            x = np.array([positions[tap] + nudge[s] for s in sub.seed])
+            ax.plot(x, sub.fvu, "o", color=colour[tap], markersize=5,
+                    markeredgewidth=0, zorder=3)
+            ax.plot([positions[tap]], [sub.fvu.mean()], "_", color=INK_PRIMARY,
+                    markersize=16, markeredgewidth=1.4, zorder=4)
+        ax.set_xticks(range(len(taps)), [TAP_LABEL.get(t, t) for t in taps])
+        ax.set_xlabel("Tap, shallow to deep")
+        ax.set_xlim(-0.6, len(taps) - 0.4)
+        if 0 < boundary < len(taps):
+            ax.axvline(boundary - 0.5, color=INK_MUTED, linewidth=0.7,
+                       linestyle=(0, (3, 3)), zorder=1)
+        handles = [plt.Line2D([0], [0], marker="o", linestyle="", color=SERIES[0]),
+                   plt.Line2D([0], [0], marker="o", linestyle="", color=SERIES[1]),
+                   plt.Line2D([0], [0], marker="_", linestyle="", color=INK_PRIMARY,
+                              markeredgewidth=1.4)]
+        ax.legend(handles, ["Convolutional", "Transformer", "Seed mean"],
+                  loc="upper right", labelcolor=INK_SECONDARY, ncol=1,
+                  handletextpad=0.5)
+        note = f"sparsity fixed, L0 = {l0[0]:.0f}"
+
+    ax.set_ylabel("Fraction of variance unexplained")
+    ax.set_ylim(0, max(1.0, float(table.fvu.max()) * 1.1))
+    ax.yaxis.grid(True)
+    ax.set_axisbelow(True)
+    ax.annotate(note, (0.01, 0.02) if not swept else (0.99, 0.99),
+                xycoords="axes fraction",
+                ha="left" if not swept else "right",
+                va="bottom" if not swept else "top",
+                fontsize=7, color=INK_SECONDARY)
+    if title:
+        ax.set_title(title, loc="left", color=INK_PRIMARY, fontsize=9, pad=6)
+    fig.tight_layout()
+    return save(fig, out, table)
+
+
+# --------------------------------------------------------------------------
+# Figure 6 - one feature in detail
+# --------------------------------------------------------------------------
+
+#: Base colours, taken from the validated slots rather than the usual ad hoc
+#: DNA scheme, so the letters stay separable under colour-vision deficiency.
+BASE_COLOUR = {"A": SERIES[2], "C": SERIES[0], "G": SERIES[3], "T": SERIES[1]}
+
+
+def information_content(sequences: Sequence[str], weights: np.ndarray | None = None,
+                        alphabet: str = "ACGT") -> np.ndarray:
+    """Per-position letter heights in bits, shaped (length, 4).
+
+    Standard sequence-logo arithmetic: a position's total height is 2 bits
+    minus its entropy, split between letters by frequency. Weighting by
+    activation lets strongly firing sites count for more.
+    """
+    if not sequences:
+        raise ValueError("No sequences")
+    length = len(sequences[0])
+    if any(len(s) != length for s in sequences):
+        raise ValueError("Sequences must all be the same length")
+    weights = (np.ones(len(sequences)) if weights is None
+               else np.asarray(weights, dtype=float))
+    if weights.shape != (len(sequences),):
+        raise ValueError("One weight per sequence")
+    weights = np.clip(weights, 0, None)
+    if weights.sum() <= 0:
+        weights = np.ones_like(weights)
+
+    counts = np.zeros((length, len(alphabet)))
+    index = {b: i for i, b in enumerate(alphabet)}
+    for sequence, weight in zip(sequences, weights):
+        for position, base in enumerate(sequence.upper()):
+            if base in index:
+                counts[position, index[base]] += weight
+    total = counts.sum(axis=1, keepdims=True)
+    frequency = np.divide(counts, total, out=np.zeros_like(counts), where=total > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        entropy = -np.nansum(np.where(frequency > 0, frequency * np.log2(frequency), 0.0),
+                             axis=1)
+    return frequency * np.clip(np.log2(len(alphabet)) - entropy, 0, None)[:, None]
+
+
+def _draw_logo(ax, heights: np.ndarray, alphabet: str = "ACGT") -> None:
+    """Draw a sequence logo by stretching glyphs to their letter heights."""
+    from matplotlib.textpath import TextPath
+    from matplotlib.patches import PathPatch
+    from matplotlib.transforms import Affine2D
+
+    for position in range(heights.shape[0]):
+        order = np.argsort(heights[position])        # smallest at the bottom
+        base_y = 0.0
+        for letter_index in order:
+            height = heights[position, letter_index]
+            if height <= 1e-3:
+                continue
+            letter = alphabet[letter_index]
+            path = TextPath((0, 0), letter, size=1, prop=None)
+            extent = path.get_extents()
+            if extent.width <= 0 or extent.height <= 0:
+                continue
+            transform = (Affine2D()
+                         .translate(-extent.x0, -extent.y0)
+                         .scale(0.86 / extent.width, height / extent.height)
+                         .translate(position + 0.07, base_y))
+            ax.add_patch(PathPatch(transform.transform_path(path),
+                                   facecolor=BASE_COLOUR.get(letter, INK_MUTED),
+                                   edgecolor="none"))
+            base_y += height
+    ax.set_xlim(0, heights.shape[0])
+    ax.set_ylim(0, max(float(heights.sum(axis=1).max()) * 1.05, 0.1))
+
+
+def figure_feature_card(
+    feature: int,
+    activation: np.ndarray,
+    sequences: Sequence[str],
+    out: str | Path,
+    *,
+    concept_auroc: Mapping[str, float] | None = None,
+    top_n: int = 12,
+    sample_n: int = 12,
+    seed: int = 0,
+) -> list[Path]:
+    """Everything about one feature on one page.
+
+    The lower strip is the point of the figure. Showing only the strongest
+    sites makes any feature look clean, so the same number of sites is drawn
+    from across the firing range. If the two strips disagree, the feature is
+    not monosemantic no matter how good its top examples look.
+    """
+    import matplotlib.pyplot as plt
+
+    activation = np.asarray(activation, dtype=float).ravel()
+    if activation.size != len(sequences):
+        raise ValueError("One sequence per activation value")
+    firing = np.flatnonzero(activation > 0)
+    if firing.size < 2:
+        raise ValueError("Feature fires on fewer than two sites")
+
+    use_style()
+    rng = np.random.default_rng(seed)
+    strongest = firing[np.argsort(activation[firing])[::-1][:top_n]]
+    # Sample the firing range in equal slices so the middle is represented.
+    ranked = firing[np.argsort(activation[firing])[::-1]]
+    edges = np.linspace(0, ranked.size, min(sample_n, ranked.size) + 1).astype(int)
+    spread = np.array([rng.integers(lo, hi) for lo, hi in zip(edges[:-1], edges[1:])
+                       if hi > lo])
+    spread = ranked[spread]
+
+    height = 6.0 if concept_auroc else 4.2
+    fig = plt.figure(figsize=(5.6, height))
+    rows = 4 if concept_auroc else 3
+    grid = fig.add_gridspec(rows, 1,
+                            height_ratios=([1.0, 0.85, 1.0, 1.0] if concept_auroc
+                                           else [1.0, 0.85, 1.0]),
+                            hspace=0.62, top=0.94, bottom=0.08,
+                            left=0.16, right=0.97)
+
+    top_logo = fig.add_subplot(grid[0])
+    _draw_logo(top_logo, information_content([sequences[i] for i in strongest],
+                                             activation[strongest]))
+    top_logo.set_title(f"Feature {feature}: top {len(strongest)} sites",
+                       loc="left", color=INK_PRIMARY, fontsize=8.5, pad=4)
+    top_logo.set_ylabel("bits")
+
+    histogram = fig.add_subplot(grid[1])
+    histogram.hist(activation[firing], bins=40, color=SEQ_MID, edgecolor="none")
+    histogram.set_yscale("log")
+    histogram.set_xlabel("Activation where the feature fires")
+    histogram.set_ylabel("Sites")
+    histogram.annotate(
+        f"fires on {firing.size / activation.size:.2%} of bins",
+        (0.99, 0.92), xycoords="axes fraction", ha="right", va="top",
+        fontsize=7, color=INK_SECONDARY)
+
+    spread_logo = fig.add_subplot(grid[2])
+    _draw_logo(spread_logo, information_content([sequences[i] for i in spread],
+                                                activation[spread]))
+    spread_logo.set_title("Sites drawn evenly across the firing range",
+                          loc="left", color=INK_SECONDARY, fontsize=8, pad=4)
+    spread_logo.set_ylabel("bits")
+
+    for axis in (top_logo, spread_logo):
+        axis.set_xticks([])
+        axis.spines["left"].set_visible(True)
+
+    if concept_auroc:
+        bars = fig.add_subplot(grid[3])
+        names = list(concept_auroc)
+        values = [float(concept_auroc[n]) for n in names]
+        order = np.argsort(values)
+        # Bars grow from 0.5, not from the axis edge. An AUROC bar drawn from
+        # an arbitrary left limit exaggerates small differences, and chance is
+        # the only meaningful zero here.
+        bars.barh([names[i] for i in order], [values[i] - 0.5 for i in order],
+                  left=0.5, color=SEQ_MID, height=0.62)
+        bars.axvline(0.5, color=INK_MUTED, linewidth=0.9, linestyle=(0, (3, 3)))
+        bars.set_xlim(0.45, 1.0)
+        bars.set_title("Concept AUROC, measured from chance", loc="left",
+                       color=INK_SECONDARY, fontsize=8, pad=4)
+        bars.set_xlabel("AUROC for this feature")
+        bars.tick_params(axis="y", length=0)
+
+    table = pd.DataFrame({
+        "rank": np.arange(len(strongest)),
+        "site": strongest,
+        "activation": activation[strongest],
+        "sequence": [sequences[i] for i in strongest],
+    })
+    return save(fig, out, table)
+
+
+# --------------------------------------------------------------------------
+# Figure 7 - do seeds find the same features
+# --------------------------------------------------------------------------
+
+
+def match_across_seeds(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """For every feature in `a`, its best cosine similarity to any in `b`.
+
+    Both are (n_features, d) decoder directions. Rows are unit-normalised
+    first, so this is cosine and not a dot product that rewards long vectors.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[1]:
+        raise ValueError("Both matrices must be (n_features, d) with the same d")
+    a = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
+    b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    return (a @ b.T).max(axis=1)
+
+
+def figure_seed_stability(
+    decoders: Mapping[int, np.ndarray],
+    out: str | Path,
+    *,
+    threshold: float = 0.7,
+    seed: int = 0,
+) -> list[Path]:
+    """How much of the dictionary survives a change of initialisation.
+
+    A null is drawn alongside, because the best match out of thousands of
+    directions is high by chance alone. Without it the curve says nothing; the
+    gap between the curve and the null is the whole result.
+    """
+    import matplotlib.pyplot as plt
+
+    seeds = sorted(decoders)
+    if len(seeds) < 2:
+        raise ValueError("Need at least two seeds to compare")
+    shapes = {np.asarray(decoders[s]).shape for s in seeds}
+    if len(shapes) != 1:
+        raise ValueError(f"Decoders disagree in shape: {sorted(shapes)}")
+
+    use_style()
+    rng = np.random.default_rng(seed)
+    n_features, d = next(iter(shapes))
+
+    pairs, records = [], []
+    for i, left in enumerate(seeds):
+        for right in seeds[i + 1:]:
+            best = match_across_seeds(decoders[left], decoders[right])
+            pairs.append((f"seed {left} vs {right}", best))
+            records.append({"pair": f"{left}-{right}",
+                            "median_cosine": float(np.median(best)),
+                            "matched_fraction": float((best >= threshold).mean())})
+
+    random_a = rng.normal(size=(n_features, d))
+    random_b = rng.normal(size=(n_features, d))
+    null = match_across_seeds(random_a, random_b)
+
+    fig, ax = plt.subplots(figsize=(4.2, 3.0))
+
+    def ecdf(values, **kwargs):
+        ordered = np.sort(values)
+        ax.step(ordered, 1.0 - np.arange(ordered.size) / ordered.size,
+                where="post", **kwargs)
+
+    for index, (label, best) in enumerate(pairs):
+        ecdf(best, color=SERIES[index % len(SERIES)], linewidth=1.8, zorder=3,
+             label=label)
+    ecdf(null, color=CONTEXT, linewidth=1.4, linestyle=(0, (3, 3)), zorder=2,
+         label="random directions")
+
+    ax.axvline(threshold, color=INK_MUTED, linewidth=0.9, linestyle=(0, (1, 2)),
+               zorder=1)
+    ax.set_xlabel("Best cosine similarity to a feature in the other seed")
+    ax.set_ylabel("Fraction of features at least this well matched")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.yaxis.grid(True)
+    ax.set_axisbelow(True)
+    matched = np.mean([r["matched_fraction"] for r in records])
+    ax.annotate(f"matched at {threshold:g}: {matched:.0%} of features",
+                (0.02, 0.03), xycoords="axes fraction", ha="left", va="bottom",
+                fontsize=7.5, color=INK_SECONDARY)
+    ax.legend(loc="upper right", labelcolor=INK_SECONDARY)
+    fig.tight_layout()
+    return save(fig, out, pd.DataFrame(records))
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 

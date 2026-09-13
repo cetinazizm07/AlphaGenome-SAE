@@ -131,3 +131,138 @@ def test_palette_slots_are_the_validated_ones():
     assert FIG.SERIES == ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")
     assert len(FIG.TAP_ORDER) == len(FIG.TAP_LABEL) == 6
     assert set(FIG.TAP_ORDER) == set(FIG.TAP_LABEL)
+
+
+class TestPareto:
+    def _runs(self, l0):
+        rows = []
+        for i, tap in enumerate(FIG.TAP_ORDER):
+            for seed in range(3):
+                rows.append({"tap": tap, "seed": seed,
+                             "mean_l0": l0[i], "fvu": 0.2 + 0.02 * i + 0.005 * seed})
+        return pd.DataFrame(rows)
+
+    def test_fixed_sparsity_falls_back_to_depth_axis(self, tmp_path):
+        runs = self._runs([409.0] * 6)
+        written = FIG.figure_pareto(runs, tmp_path / "pareto")
+        assert {p.suffix for p in written} == {".pdf", ".svg", ".png", ".csv"}
+        # With L0 pinned the x axis must carry the taps, not the sparsity.
+        assert "L0 = 409" in (tmp_path / "pareto.svg").read_text()
+
+    def test_a_real_sweep_draws_the_trade_off(self, tmp_path):
+        runs = self._runs([50.0, 100.0, 200.0, 400.0, 800.0, 1600.0])
+        FIG.figure_pareto(runs, tmp_path / "sweep")
+        assert "Mean L0" in (tmp_path / "sweep.svg").read_text()
+
+    def test_missing_columns_are_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="missing"):
+            FIG.figure_pareto(pd.DataFrame({"tap": ["a"], "seed": [0]}), tmp_path / "x")
+
+
+class TestInformationContent:
+    def test_one_repeated_sequence_is_two_bits_everywhere(self):
+        heights = FIG.information_content(["ACGT"] * 5)
+        assert heights.sum(axis=1) == pytest.approx([2.0] * 4)
+
+    def test_uniform_bases_carry_no_information(self):
+        heights = FIG.information_content(["A", "C", "G", "T"])
+        assert heights.sum() == pytest.approx(0.0, abs=1e-9)
+
+    def test_weights_shift_the_consensus(self):
+        # Same two sequences, but weighting the second one heavily should move
+        # the tallest letter at position 0 from A to T.
+        heights = FIG.information_content(["AAAA", "TAAA"], weights=np.array([0.01, 10.0]))
+        assert heights[0].argmax() == 3
+
+    def test_ragged_input_is_rejected(self):
+        with pytest.raises(ValueError, match="same length"):
+            FIG.information_content(["AC", "ACG"])
+
+
+class TestFeatureCard:
+    def _data(self, n=400, length=12):
+        rng = np.random.default_rng(0)
+        sequences = ["".join(rng.choice(list("ACGT"), length)) for _ in range(n)]
+        activation = np.zeros(n)
+        hot = rng.choice(n, 60, replace=False)
+        activation[hot] = rng.gamma(2.0, 1.0, hot.size)
+        for i in hot:                                  # plant a motif
+            sequences[i] = sequences[i][:4] + "GGTCA" + sequences[i][9:]
+        return activation, sequences
+
+    def test_card_writes_every_format(self, tmp_path):
+        activation, sequences = self._data()
+        written = FIG.figure_feature_card(7, activation, sequences, tmp_path / "card",
+                                        concept_auroc={"PLS": 0.81, "dELS": 0.55})
+        assert {p.suffix for p in written} == {".pdf", ".svg", ".png", ".csv"}
+        table = pd.read_csv(tmp_path / "card.csv")
+        # The CSV must be the strongest sites, in order.
+        assert table.activation.is_monotonic_decreasing
+
+    def test_a_silent_feature_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="fewer than two"):
+            FIG.figure_feature_card(0, np.zeros(50), ["ACGT"] * 50, tmp_path / "x")
+
+    def test_length_mismatch_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="One sequence per"):
+            FIG.figure_feature_card(0, np.ones(10), ["ACGT"] * 9, tmp_path / "x")
+
+
+class TestSeedStability:
+    def test_identical_dictionaries_match_perfectly(self):
+        rng = np.random.default_rng(0)
+        d = rng.normal(size=(64, 16))
+        assert FIG.match_across_seeds(d, d) == pytest.approx(np.ones(64), abs=1e-9)
+
+    def test_scaling_a_row_does_not_change_cosine(self):
+        rng = np.random.default_rng(1)
+        a, b = rng.normal(size=(32, 8)), rng.normal(size=(32, 8))
+        plain = FIG.match_across_seeds(a, b)
+        scaled = FIG.match_across_seeds(a * 7.0, b)
+        assert plain == pytest.approx(scaled, abs=1e-9)
+
+    def test_figure_needs_two_seeds(self, tmp_path):
+        with pytest.raises(ValueError, match="two seeds"):
+            FIG.figure_seed_stability({0: np.ones((4, 3))}, tmp_path / "x")
+
+    def test_figure_writes_a_row_per_pair(self, tmp_path):
+        rng = np.random.default_rng(2)
+        shared = rng.normal(size=(48, 20))
+        decoders = {s: shared + 0.25 * rng.normal(size=(48, 20)) for s in (0, 1, 2)}
+        FIG.figure_seed_stability(decoders, tmp_path / "stab")
+        table = pd.read_csv(tmp_path / "stab.csv")
+        assert sorted(table.pair) == ["0-1", "0-2", "1-2"]
+        assert (table.matched_fraction >= 0).all()
+
+
+class TestPareto2:
+    def test_a_tower_only_subset_is_not_coloured_as_conv(self, tmp_path):
+        # The conv/tower split must follow the tap's identity. Classifying by
+        # position in the subset would paint these three as convolutional.
+        tower = FIG.TAP_ORDER[FIG.N_CONV_TAPS:]
+        runs = pd.DataFrame([{"tap": t, "seed": s, "mean_l0": 409.0, "fvu": 0.2}
+                             for t in tower for s in range(2)])
+        FIG.figure_pareto(runs, tmp_path / "tower")
+        svg = (tmp_path / "tower.svg").read_text()
+        assert FIG.SERIES[1].lstrip("#") in svg.replace("#", "")
+        assert "Transformer" in svg
+
+    def test_conv_only_subset_keeps_the_conv_colour(self, tmp_path):
+        conv = FIG.TAP_ORDER[:FIG.N_CONV_TAPS]
+        runs = pd.DataFrame([{"tap": t, "seed": s, "mean_l0": 409.0, "fvu": 0.3}
+                             for t in conv for s in range(2)])
+        FIG.figure_pareto(runs, tmp_path / "conv")
+        assert "Convolutional" in (tmp_path / "conv.svg").read_text()
+
+
+class TestSpreadLabels:
+    def test_coincident_anchors_are_pushed_apart(self):
+        anchors = [[1.0, 0.5, "a"], [1.0, 0.5, "b"], [1.0, 0.5, "c"]]
+        out = FIG._spread_labels(anchors, gap=0.1)
+        ys = [row[1] for row in out]
+        assert ys == pytest.approx([0.5, 0.6, 0.7])
+
+    def test_well_separated_anchors_are_left_alone(self):
+        anchors = [[1.0, 0.0, "a"], [1.0, 0.9, "b"]]
+        out = FIG._spread_labels(anchors, gap=0.1)
+        assert [row[1] for row in out] == pytest.approx([0.0, 0.9])
