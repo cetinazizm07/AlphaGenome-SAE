@@ -266,3 +266,76 @@ class TestSpreadLabels:
         anchors = [[1.0, 0.0, "a"], [1.0, 0.9, "b"]]
         out = FIG._spread_labels(anchors, gap=0.1)
         assert [row[1] for row in out] == pytest.approx([0.0, 0.9])
+
+
+class TestBrowser:
+    def _bins(self, n=512, start=1_000_000, bp=128):
+        edges = start + np.arange(n) * bp
+        return pd.DataFrame({"chrom": "chr7", "bin_start": edges, "bin_end": edges + bp})
+
+    def test_centromere_is_the_widest_gap(self):
+        gaps = pd.DataFrame({
+            "chrom": ["chr7", "chr7", "chr8"],
+            "start": [100, 5_000, 10],
+            "end": [600, 3_000_000, 90],
+        })
+        assert FIG.centromere_from_gaps(gaps, "chr7") == (5_000, 3_000_000)
+        assert FIG.centromere_from_gaps(gaps, "chrY") is None
+
+    def test_browser_writes_every_format(self, tmp_path):
+        bins = self._bins()
+        rng = np.random.default_rng(0)
+        tracks = {"feature 12": rng.gamma(0.5, 1.0, len(bins)),
+                  "feature 88": rng.gamma(0.5, 1.0, len(bins))}
+        ccre = {"PLS": {"chr7": np.array([[1_010_000, 1_010_400]], dtype=np.int64)}}
+        written = FIG.figure_browser(bins, tracks, tmp_path / "browser", ccre=ccre,
+                                     chrom_length=159_345_973,
+                                     centromere=(58_100_000, 62_100_000))
+        assert {p.suffix for p in written} == {".pdf", ".svg", ".png", ".csv"}
+        table = pd.read_csv(tmp_path / "browser.csv")
+        assert list(table.columns) == ["chrom", "bin_start", "bin_end",
+                                       "feature 12", "feature 88"]
+
+    def test_two_chromosomes_are_refused(self, tmp_path):
+        bins = self._bins(4)
+        bins.loc[0, "chrom"] = "chr1"
+        with pytest.raises(ValueError, match="one chromosome"):
+            FIG.figure_browser(bins, {"a": np.ones(4)}, tmp_path / "x")
+
+    def test_track_length_must_match_the_bins(self, tmp_path):
+        with pytest.raises(ValueError, match="values for"):
+            FIG.figure_browser(self._bins(8), {"a": np.ones(7)}, tmp_path / "x")
+
+    def test_too_many_tracks_are_refused(self, tmp_path):
+        bins = self._bins(8)
+        tracks = {f"f{i}": np.ones(8) for i in range(len(FIG.SERIES) + 1)}
+        with pytest.raises(ValueError, match="At most"):
+            FIG.figure_browser(bins, tracks, tmp_path / "x")
+
+    def test_long_windows_are_pooled(self, tmp_path):
+        bins = self._bins(8192)
+        FIG.figure_browser(bins, {"f": np.arange(8192.0)}, tmp_path / "pooled",
+                           max_points=900)
+        # The note must say the track was pooled, not silently thin it.
+        assert "peak of every" in (tmp_path / "pooled.svg").read_text()
+
+    def test_coordinate_labels_switch_unit(self):
+        assert FIG._coordinate_label(2_500_000) == "2.5 Mb"
+        assert FIG._coordinate_label(4_000) == "4 kb"
+        assert FIG._coordinate_label(250) == "250"
+
+
+class TestLogoOrder:
+    def test_the_tallest_letter_is_drawn_on_top(self):
+        import matplotlib.pyplot as plt
+        # One dominant base plus a rare one. The tall letter must occupy the
+        # upper part of the stack, which is how a logo is read.
+        heights = np.array([[1.8, 0.2, 0.0, 0.0]])      # A tall, C short
+        fig, ax = plt.subplots()
+        FIG._draw_logo(ax, heights)
+        boxes = [patch.get_extents() for patch in ax.patches]
+        plt.close(fig)
+        assert boxes, "no glyphs drawn"
+        tallest = max(boxes, key=lambda b: b.height)
+        shortest = min(boxes, key=lambda b: b.height)
+        assert tallest.y0 > shortest.y0 or tallest.y1 > shortest.y1

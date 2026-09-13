@@ -577,33 +577,25 @@ def information_content(sequences: Sequence[str], weights: np.ndarray | None = N
 
 
 def _draw_logo(ax, heights: np.ndarray, alphabet: str = "ACGT") -> None:
-    """Draw a sequence logo by stretching glyphs to their letter heights."""
-    from matplotlib.textpath import TextPath
-    from matplotlib.patches import PathPatch
-    from matplotlib.transforms import Affine2D
+    """Draw a sequence logo with logomaker, in the module's base colours.
 
-    for position in range(heights.shape[0]):
-        order = np.argsort(heights[position])        # smallest at the bottom
-        base_y = 0.0
-        for letter_index in order:
-            height = heights[position, letter_index]
-            if height <= 1e-3:
-                continue
-            letter = alphabet[letter_index]
-            path = TextPath((0, 0), letter, size=1, prop=None)
-            extent = path.get_extents()
-            if extent.width <= 0 or extent.height <= 0:
-                continue
-            transform = (Affine2D()
-                         .translate(-extent.x0, -extent.y0)
-                         .scale(0.86 / extent.width, height / extent.height)
-                         .translate(position + 0.07, base_y))
-            ax.add_patch(PathPatch(transform.transform_path(path),
-                                   facecolor=BASE_COLOUR.get(letter, INK_MUTED),
-                                   edgecolor="none"))
-            base_y += height
-    ax.set_xlim(0, heights.shape[0])
+    logomaker is the field-standard renderer, so the letters look like every
+    other logo a reader has seen. It wants a (position, letter) frame, which is
+    what `information_content` already returns once it is labelled.
+    """
+    import logomaker
+
+    frame = pd.DataFrame(heights, columns=list(alphabet))
+    frame.index.name = "pos"
+    # big_on_top is the convention: readers take the top letter of each stack
+    # as the consensus base, so inverting the order inverts the reading.
+    logomaker.Logo(frame, ax=ax, color_scheme=dict(BASE_COLOUR),
+                   show_spines=False, vpad=0.02, stack_order="big_on_top")
+    ax.set_xlim(-0.5, heights.shape[0] - 0.5)
     ax.set_ylim(0, max(float(heights.sum(axis=1).max()) * 1.05, 0.1))
+    ax.spines["left"].set_visible(True)
+    ax.spines["left"].set_color(INK_MUTED)
+    ax.spines["left"].set_linewidth(0.6)
 
 
 def figure_feature_card(
@@ -793,6 +785,190 @@ def figure_seed_stability(
     ax.legend(loc="upper right", labelcolor=INK_SECONDARY)
     fig.tight_layout()
     return save(fig, out, pd.DataFrame(records))
+
+
+# --------------------------------------------------------------------------
+# Figure 9 - genome browser view
+# --------------------------------------------------------------------------
+
+
+def centromere_from_gaps(gaps: pd.DataFrame, chrom: str) -> tuple[int, int] | None:
+    """Largest assembly gap on a chromosome.
+
+    In GRCh38 the centromere is modelled as a long run of N, so the biggest gap
+    on a chromosome is it. This avoids pulling in a cytoband file for what is a
+    single landmark on the ideogram.
+    """
+    on_chrom = gaps[gaps.chrom == chrom]
+    if on_chrom.empty:
+        return None
+    widest = (on_chrom.end - on_chrom.start).idxmax()
+    return int(on_chrom.loc[widest, "start"]), int(on_chrom.loc[widest, "end"])
+
+
+def _coordinate_label(value: float, _position: int = 0) -> str:
+    """Axis ticks as Mb or kb, whichever keeps the number short."""
+    if abs(value) >= 1e6:
+        return f"{value / 1e6:g} Mb"
+    if abs(value) >= 1e3:
+        return f"{value / 1e3:g} kb"
+    return f"{value:g}"
+
+
+def _draw_ideogram(ax, chrom: str, length: int, window: tuple[int, int],
+                   centromere: tuple[int, int] | None) -> None:
+    """The whole chromosome as one bar, with the viewed window marked."""
+    from matplotlib.patches import FancyBboxPatch, Rectangle
+
+    ax.add_patch(FancyBboxPatch(
+        (0, 0.32), length, 0.36,
+        boxstyle="round,pad=0,rounding_size=" + str(length * 0.004),
+        linewidth=0.8, edgecolor=INK_MUTED, facecolor=GRID, zorder=2))
+    if centromere is not None:
+        start, end = centromere
+        ax.add_patch(Rectangle((start, 0.32), max(end - start, length * 0.003),
+                               0.36, linewidth=0, facecolor=INK_MUTED, zorder=3))
+    # The window is usually far too narrow to see, so it gets a minimum width
+    # and a label rather than a faithful rectangle.
+    left, right = window
+    width = max(right - left, length * 0.004)
+    ax.add_patch(Rectangle((left, 0.22), width, 0.56, linewidth=1.2,
+                           edgecolor=SERIES[1], facecolor="none", zorder=4))
+    span = (right - left) / 1e3
+    ax.annotate(f"{chrom}:{left:,}-{right:,}  ({span:,.0f} kb)",
+                (left + width / 2, 0.86), ha="center", va="bottom",
+                fontsize=7, color=INK_SECONDARY, zorder=5)
+    ax.set_xlim(-length * 0.01, length * 1.01)
+    ax.set_ylim(0, 1.25)
+    ax.set_yticks([])
+    ax.set_xticks([0, length])
+    ax.set_xticklabels(["0", _coordinate_label(length)], fontsize=7)
+    for side in ("top", "right", "left", "bottom"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(length=0, pad=1)
+
+
+def figure_browser(
+    bins: pd.DataFrame,
+    tracks: Mapping[str, np.ndarray],
+    out: str | Path,
+    *,
+    ccre: Mapping[str, Mapping[str, np.ndarray]] | None = None,
+    genes: pd.DataFrame | None = None,
+    chrom_length: int | None = None,
+    centromere: tuple[int, int] | None = None,
+    max_points: int = MAX_PROFILE_POINTS,
+    title: str = "",
+) -> list[Path]:
+    """A browser view: ideogram, feature tracks, annotation lanes, one ruler.
+
+    Everything below the ideogram shares the coordinate axis, so a peak in a
+    track sits directly above the element it overlaps. That vertical alignment
+    is the whole reason to draw this rather than four separate panels.
+
+    Tracks are max-pooled above `max_points`, because a 1 Mb window at 128 bp
+    is 8192 bins and a line with 8192 vertices on a 6 inch axis is a block of
+    ink. Pooling keeps the peaks; it is stated on the axis.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import FuncFormatter
+
+    if not tracks:
+        raise ValueError("Need at least one track")
+    if len(tracks) > len(SERIES):
+        raise ValueError(f"At most {len(SERIES)} tracks; got {len(tracks)}")
+    chroms = bins.chrom.unique()
+    if len(chroms) != 1:
+        raise ValueError(f"A browser view covers one chromosome, got {list(chroms)}")
+    for name, values in tracks.items():
+        if len(values) != len(bins):
+            raise ValueError(f"Track {name!r} has {len(values)} values for {len(bins)} bins")
+
+    use_style()
+    chrom = str(chroms[0])
+    starts = bins.bin_start.to_numpy(dtype=np.int64)
+    ends = bins.bin_end.to_numpy(dtype=np.int64)
+    window = (int(starts.min()), int(ends.max()))
+
+    classes = list(ccre) if ccre else []
+    n_lanes = len(classes) + (1 if genes is not None and not genes.empty else 0)
+    rows = 1 + len(tracks) + (1 if n_lanes else 0)
+    heights = [0.55] + [1.0] * len(tracks) + ([0.26 * max(n_lanes, 1)] if n_lanes else [])
+    figure_height = 1.1 + 0.95 * len(tracks) + 0.34 * n_lanes
+    fig = plt.figure(figsize=(6.4, figure_height))
+    grid = fig.add_gridspec(rows, 1, height_ratios=heights, hspace=0.18,
+                            left=0.13, right=0.98, top=0.90, bottom=0.13)
+
+    ideogram = fig.add_subplot(grid[0])
+    _draw_ideogram(ideogram, chrom, int(chrom_length or window[1]), window, centromere)
+    if title:
+        ideogram.set_title(title, loc="left", color=INK_PRIMARY, fontsize=9, pad=10)
+
+    pooled_note = ""
+    axes = []
+    for index, (name, values) in enumerate(tracks.items()):
+        axis = fig.add_subplot(grid[1 + index], sharex=axes[0] if axes else None)
+        axes.append(axis)
+        x, y = starts.astype(float), np.asarray(values, dtype=float)
+        if x.size > max_points:
+            fold = int(np.ceil(x.size / max_points))
+            usable = (x.size // fold) * fold
+            x = x[:usable].reshape(-1, fold)[:, 0]
+            y = y[:usable].reshape(-1, fold).max(axis=1)
+            pooled_note = f"peak of every {fold} bins"
+        axis.fill_between(x, 0, y, color=SERIES[index], linewidth=0, alpha=0.9,
+                          step="post")
+        axis.set_ylabel(name, rotation=0, ha="right", va="center",
+                        fontsize=7.5, color=INK_SECONDARY, labelpad=6)
+        axis.set_ylim(0, max(float(y.max()) * 1.08, 1e-9))
+        axis.set_yticks([0, float(y.max())])
+        axis.set_yticklabels(["0", f"{y.max():.3g}"], fontsize=6.5)
+        axis.spines["bottom"].set_visible(False)
+        axis.tick_params(axis="x", length=0, labelbottom=False)
+
+    if n_lanes:
+        lanes = fig.add_subplot(grid[-1], sharex=axes[0])
+        axes.append(lanes)
+        labels = []
+        for lane, name in enumerate(classes):
+            spans = ccre[name].get(chrom, np.empty((0, 2), dtype=np.int64))
+            for span_start, span_end in np.asarray(spans, dtype=np.int64):
+                if span_end <= window[0] or span_start >= window[1]:
+                    continue
+                lanes.add_patch(Rectangle(
+                    (span_start, lane + 0.15), max(span_end - span_start, 1), 0.7,
+                    linewidth=0, facecolor=SERIES[lane % len(SERIES)]))
+            labels.append(name)
+        if genes is not None and not genes.empty:
+            lane = len(classes)
+            for gene in genes.itertuples(index=False):
+                lanes.add_patch(Rectangle((gene.start, lane + 0.38),
+                                          max(gene.end - gene.start, 1), 0.24,
+                                          linewidth=0, facecolor=INK_SECONDARY))
+                # The lane axis is inverted, so larger y is lower on screen.
+                # va="top" is what puts the name under the gene body instead
+                # of printing it across the bar.
+                lanes.annotate(gene.name, ((gene.start + gene.end) / 2, lane + 0.66),
+                               ha="center", va="top", fontsize=6,
+                               color=INK_SECONDARY, style="italic")
+            labels.append("genes")
+        lanes.set_ylim(len(labels), 0)
+        lanes.set_yticks(np.arange(len(labels)) + 0.5, labels, fontsize=7)
+        lanes.tick_params(axis="y", length=0)
+        for side in ("left", "right", "top"):
+            lanes.spines[side].set_visible(False)
+
+    ruler = axes[-1]
+    ruler.tick_params(axis="x", length=3, labelbottom=True)
+    ruler.spines["bottom"].set_visible(True)
+    ruler.xaxis.set_major_formatter(FuncFormatter(_coordinate_label))
+    ruler.set_xlim(window)
+    ruler.set_xlabel(f"{chrom}" + (f"   ({pooled_note})" if pooled_note else ""))
+
+    table = pd.DataFrame({"chrom": chrom, "bin_start": starts, "bin_end": ends,
+                          **{name: np.asarray(v, dtype=float) for name, v in tracks.items()}})
+    return save(fig, out, table)
 
 
 # --------------------------------------------------------------------------

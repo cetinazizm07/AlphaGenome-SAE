@@ -92,11 +92,37 @@ whether the layout holds, never the values.
 | 06_pareto_sparsity_sweep | The same figure if sparsity were swept instead of pinned by TopK. Not our design; included to show the other layout. |
 | 07_feature_card | Everything about one feature. The second logo is the honest one: if it disagrees with the first, the feature is not monosemantic. |
 | 08_seed_stability | How much of the dictionary survives a change of seed, against what random directions would give. |
+| 09_browser | A browser view: where on the chromosome we are, several feature tracks, and the annotation lanes underneath, all on one coordinate axis. |
+| igv/ | The same tracks as bedGraph and BED, plus an igv.js session. Loads in IGV desktop, igv-notebook or UCSC. See `igv/README.md`. |
 
 Each figure ships as PDF, SVG, 300 dpi PNG and a CSV of its numbers. The SVG
 keeps text as text, so it opens editable in Illustrator.
 
 Rebuild with `PYTHONPATH=. python examples/make_examples.py`.
+"""
+
+
+IGV_NOTE = """# The same tracks, for a real browser
+
+`figure_browser` draws the publication version. These are the same numbers in
+formats any genome browser reads.
+
+**IGV desktop or igv.js**: open hg38, then drag every `.bedgraph` and `.bed`
+file in this folder onto the window and go to `{locus}`.
+
+**igv-notebook**, in a Jupyter cell:
+
+```python
+import json
+from ag_sae import tracks
+
+config = json.load(open("igv_session.json"))
+tracks.show(config)          # needs: pip install igv-notebook
+```
+
+The paths in `igv_session.json` are relative, so run the notebook from this
+folder. The coordinates are synthetic: they point at real chr7 positions but the
+signal is invented, so anything that looks like a finding here is noise.
 """
 
 
@@ -183,6 +209,68 @@ def main(argv=None) -> int:
         keep = rng.random(len(shared)) < 0.66
         decoders[seed] = np.where(keep[:, None], shared + 0.35 * noise, noise)
     written += fig.figure_seed_stability(decoders, out / "08_seed_stability")
+
+    # 8. browser view -----------------------------------------------------
+    # A narrower window than the locus figure, because a browser view is for
+    # reading individual elements and 1 Mb is an overview.
+    view = 1200
+    view_bins = bins.iloc[:view].copy()
+    view_bins["bin_start"] += 30_000_000
+    view_bins["bin_end"] += 30_000_000
+    view_bins["chrom"] = "chr7"
+    lo = int(view_bins.bin_start.min())
+    tracks = {}
+    for name, offset in (("feature 1423", 0), ("feature 0291", 7), ("feature 5560", 13)):
+        signal = np.clip(rng.gamma(0.35, 0.4, view), 0, None)
+        for centre in rng.choice(view, 14, replace=False):
+            signal[centre:centre + 3] += rng.gamma(4.0, 0.7)
+        tracks[name] = np.roll(signal, offset)
+    view_ccre = {}
+    for lane, name in enumerate(("PLS", "pELS", "dELS")):
+        centres = np.sort(rng.choice(view, 18, replace=False))
+        widths = rng.integers(1, 4, centres.size)
+        view_ccre[name] = {"chr7": np.stack(
+            [lo + centres * 128, lo + (centres + widths) * 128], axis=1).astype(np.int64)}
+    gene_start = lo + 300 * 128
+    genes = pd.DataFrame({
+        "name": ["SYNTH1", "SYNTH2"],
+        "start": [gene_start, gene_start + 420 * 128],
+        "end": [gene_start + 180 * 128, gene_start + 700 * 128],
+    })
+    written += fig.figure_browser(
+        view_bins, tracks, out / "09_browser", ccre=view_ccre, genes=genes,
+        chrom_length=159_345_973, centromere=(58_100_000, 62_100_000),
+        title="Three features across 154 kb of chr7")
+
+    # 9. the same data as browser tracks ---------------------------------
+    # figure_browser is the paper version. These files are the same numbers in
+    # formats IGV, igv.js, igv-notebook and UCSC all read, for looking around.
+    import json
+    from ag_sae import tracks as tr
+
+    igv_dir = out / "igv"
+    igv_dir.mkdir(exist_ok=True)
+    entries = []
+    for index, (name, values) in enumerate(tracks.items()):
+        slug = name.replace(" ", "_")
+        path = tr.write_bedgraph(view_bins, values, igv_dir / f"{slug}.bedgraph",
+                                 name=name, colour=fig.SERIES[index],
+                                 description="synthetic SAE feature activation")
+        entries.append(tr.bedgraph_track(path.name, name=name,
+                                         colour=fig.SERIES[index]))
+    for index, (name, spans) in enumerate(view_ccre.items()):
+        path = tr.write_interval_bed(spans, igv_dir / f"cCRE_{name}.bed", name=name,
+                                     colour=fig.SERIES[index])
+        entries.append(tr.annotation_track(path.name, name=f"cCRE {name}",
+                                           colour=fig.SERIES[index]))
+    gene_spans = {"chr7": genes[["start", "end"]].to_numpy(dtype=np.int64)}
+    tr.write_interval_bed(gene_spans, igv_dir / "genes.bed", name="genes")
+    entries.append(tr.annotation_track("genes.bed", name="genes"))
+
+    locus = f"chr7:{int(view_bins.bin_start.min()):,}-{int(view_bins.bin_end.max()):,}"
+    config = tr.igv_config(entries, locus=locus)
+    (igv_dir / "igv_session.json").write_text(json.dumps(config, indent=2))
+    (igv_dir / "README.md").write_text(IGV_NOTE.format(locus=locus))
 
     (out / "README.md").write_text(INDEX)
     print(f"{len(written)} files in {out}")
