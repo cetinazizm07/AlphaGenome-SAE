@@ -1,0 +1,187 @@
+{
+  "schema": "ag-sae/concept-panel/1",
+  "frozen_at": "2026-09-13",
+  "assembly": "GRCh38",
+  "bin_bp": 128,
+  "note": "Roles are frozen before any run. Changing a role after seeing results turns an exploratory finding into a confirmatory claim it never was.",
+
+  "sources": {
+    "encode_ccre": {
+      "description": "ENCODE registry of candidate cis-regulatory elements, GRCh38, aggregated over all biosamples",
+      "annotation": "ENCSR487PRC",
+      "encyclopedia_version": ["ENCODE v3", "current"],
+      "date_released": "2022-02-15",
+      "file": "ENCFF234XEZ",
+      "url": "https://www.encodeproject.org/files/ENCFF234XEZ/@@download/ENCFF234XEZ.bed.gz",
+      "bytes": 15344989,
+      "md5": "dbb963a08dfe7e489c746e38448adae7",
+      "md5_verified_on_download": true,
+      "format": "BED9+1, gzipped",
+      "class_column_0based": 9,
+      "class_column_note": "Column 10 (1-based) holds comma-separated labels, e.g. 'pELS,CTCF-bound'. The default class column in read_ccre_bed is 5 and is wrong for this file; pass --class-column 9.",
+      "bigbed_alternative": {"file": "ENCFF081NFZ", "bytes": 36214886, "md5": "2158ec96bf1b4942f35b8e254cee77cc"},
+      "measured": {
+        "elements_total": 1063878,
+        "mean_length_bp": 273,
+        "covered_mb": 290.1,
+        "elements_by_label": {
+          "dELS": 789200, "CTCF-bound": 450641, "pELS": 172027,
+          "PLS": 40891, "CTCF-only": 35839, "DNase-H3K4me3": 25921
+        }
+      }
+    },
+
+    "gencode_gtf": {
+      "description": "GENCODE basic annotation: one representative transcript set, which avoids inflating splice-site counts with rare isoforms",
+      "release": "50",
+      "file": "gencode.v50.basic.annotation.gtf.gz",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.basic.annotation.gtf.gz",
+      "bytes": 79970394,
+      "md5": "11e77cf1d4b78b43f57d608e3f7f2202",
+      "full_annotation_alternative": {
+        "file": "gencode.v50.annotation.gtf.gz",
+        "md5": "2d273848c6068682fabea72fae4896a9"
+      }
+    },
+
+    "genome_fasta": {
+      "description": "GRCh38 primary assembly, used for GC content and for the N runs excluded at window selection",
+      "release": "50",
+      "file": "GRCh38.primary_assembly.genome.fa.gz",
+      "url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/GRCh38.primary_assembly.genome.fa.gz",
+      "bytes": 845635028,
+      "md5": "da1a11258be075cfa7af718162c894e7"
+    }
+  },
+
+  "concepts": [
+    {
+      "name": "cCRE_PLS",
+      "role": "primary",
+      "question": "Does a feature mark promoter-like regions?",
+      "derivation": {"kind": "ccre_class", "source": "encode_ccre", "label": "PLS"},
+      "expected_elements": 40891,
+      "windows_for_pm0.02_auroc": 133
+    },
+    {
+      "name": "cCRE_pELS",
+      "role": "primary",
+      "question": "Does a feature mark proximal enhancer-like regions (within 2 kb of a TSS)?",
+      "derivation": {"kind": "ccre_class", "source": "encode_ccre", "label": "pELS"},
+      "expected_elements": 172027,
+      "windows_for_pm0.02_auroc": 32
+    },
+    {
+      "name": "cCRE_dELS",
+      "role": "primary",
+      "question": "Does a feature mark distal enhancer-like regions (beyond 2 kb from a TSS)?",
+      "derivation": {"kind": "ccre_class", "source": "encode_ccre", "label": "dELS"},
+      "expected_elements": 789200,
+      "windows_for_pm0.02_auroc": 7,
+      "pairs_with": "cCRE_pELS",
+      "pairing_note": "pELS and dELS come from the same experimental signal and differ only in distance to the nearest TSS. If their depth curves separate, that separation is about long-range position and nothing else."
+    },
+    {
+      "name": "cCRE_CTCF-only",
+      "role": "primary",
+      "question": "Does a feature mark CTCF-bound sites without enhancer or promoter signal?",
+      "derivation": {"kind": "ccre_class", "source": "encode_ccre", "label": "CTCF-only"},
+      "expected_elements": 35839,
+      "windows_for_pm0.02_auroc": 151
+    },
+    {
+      "name": "cCRE_DNase-H3K4me3",
+      "role": "primary",
+      "question": "Does a feature mark accessible H3K4me3 sites that are not promoter-like?",
+      "derivation": {"kind": "ccre_class", "source": "encode_ccre", "label": "DNase-H3K4me3"},
+      "expected_elements": 25921,
+      "windows_for_pm0.02_auroc": 209,
+      "power_note": "Rarest class in the panel. With 200 test windows per fold this sits just under the target precision; report its interval and do not over-read a small difference."
+    },
+    {
+      "name": "cCRE_any",
+      "role": "primary",
+      "question": "Does a feature mark regulatory elements in general, rather than one class?",
+      "derivation": {"kind": "ccre_union", "source": "encode_ccre"},
+      "expected_elements": 1063878,
+      "windows_for_pm0.02_auroc": 6,
+      "purpose": "Specificity control. A feature scoring as high here as on a single class is detecting accessible chromatin, not that class."
+    },
+
+    {
+      "name": "splice_donor",
+      "role": "local",
+      "hypothesis": "H1",
+      "question": "Does a feature mark 5' splice sites?",
+      "derivation": {
+        "kind": "gencode_splice", "source": "gencode_gtf", "site": "donor",
+        "flank_bp": 10,
+        "definition": "Intron start on the + strand, intron end on the - strand, taken from consecutive exons of the same transcript. Interval is the site +/- flank_bp."
+      },
+      "purpose": "A 6-20 bp sequence motif. Should be recoverable at the conv taps and should not need the tower."
+    },
+    {
+      "name": "splice_acceptor",
+      "role": "local",
+      "hypothesis": "H1",
+      "question": "Does a feature mark 3' splice sites?",
+      "derivation": {
+        "kind": "gencode_splice", "source": "gencode_gtf", "site": "acceptor",
+        "flank_bp": 10,
+        "definition": "Intron end on the + strand, intron start on the - strand. Interval is the site +/- flank_bp."
+      }
+    },
+
+    {
+      "name": "TSS_within_2kb",
+      "role": "contextual",
+      "hypothesis": "H2",
+      "question": "Is this bin close to a transcription start site?",
+      "derivation": {
+        "kind": "gencode_tss_window", "source": "gencode_gtf", "window_bp": 2000,
+        "feature": "transcript",
+        "definition": "Transcript start on the + strand, transcript end on the - strand, extended by window_bp on both sides."
+      },
+      "purpose": "Distance to the nearest TSS is not available inside a 34 bp receptive field but is available inside a 1 Mb context. The cleanest separator between conv and tower in the panel."
+    },
+
+    {
+      "name": "GC_rich",
+      "role": "positive_control",
+      "question": "Does the pipeline recover something the model certainly encodes?",
+      "derivation": {
+        "kind": "gc_quantile", "source": "genome_fasta", "quantile": 0.75,
+        "definition": "Bins whose GC fraction is in the top quartile of valid bins on the same chromosome. Bins containing any ambiguous base are excluded before the quantile is taken."
+      },
+      "must_be_recovered": true,
+      "purpose": "Must clear the null at every tap. If it does not, the fault is in the matching pipeline, not in the model."
+    },
+
+    {
+      "name": "shuffled_dELS",
+      "role": "negative_control",
+      "question": "Does the pipeline call something significant when nothing is there?",
+      "derivation": {
+        "kind": "shuffle_of", "concept": "cCRE_dELS", "seed": 0,
+        "definition": "dELS intervals relocated uniformly at random within the same chromosome, keeping count and length and avoiding assembly gaps."
+      },
+      "must_not_be_recovered": true,
+      "purpose": "Must sit at the null ceiling. Anything above it means the mask or the metric is wrong."
+    }
+  ],
+
+  "not_included": {
+    "repeat_families": "RepeatMasker Alu/L1 would link directly to the transposable-element features in the reference study, but UCSC is a third source and its checksum could not be pinned from the published md5sum list. Add it as a separate, dated amendment if wanted.",
+    "ENCODE_blacklist": "Intended as an artifact diagnostic rather than a concept. The portal search for annotation_type=blacklist returned nothing, so it is left out rather than guessed at.",
+    "cell_type_specific_cCREs": "The per-biosample cCRE files (1522 of them) would allow a cell-type-specific arm. Out of scope here: AlphaGenome sees only sequence, so a cell-type-specific label is largely unpredictable from its input."
+  },
+
+  "evaluation_rules": {
+    "grid": "All concepts are evaluated on the 128 bp bin grid. Features from finer taps are max-pooled up to that grid.",
+    "mask": "Bins containing any ambiguous base are excluded at every stage, identically.",
+    "null": "Circular shift within contiguous runs of bins on a chromosome, taking the maximum over the dictionary, matching the best-of-many statistic that is reported.",
+    "baseline": "Every SAE AUROC is reported next to the same statistic on the tap's raw channels.",
+    "splits": "Tuning may look at the dev split only. The test split is read once, after all choices are frozen.",
+    "uncertainty": "Adjacent bins are not independent. Intervals come from a bootstrap over windows, not over bins."
+  }
+}

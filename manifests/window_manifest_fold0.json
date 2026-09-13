@@ -1,0 +1,50 @@
+{
+  "model_fold": 0,
+  "valid_fold": "fold0",
+  "test_fold": "fold1",
+  "heldout_mb": 661.2,
+  "trained_mb": 2089.0,
+  "window_bp": 1048576,
+  "seed": 0,
+  "context_bp": 1048576,
+  "target_bp": 196608,
+  "context_margin_bp": 425984,
+  "available_windows": {
+    "heldout": 590,
+    "trained": 1880
+  },
+  "selected_windows": {
+    "train": 1000,
+    "test_trained": 200,
+    "test": 200,
+    "val": 100,
+    "dev": 100
+  },
+  "chroms": [
+    "chr1",
+    "chr10",
+    "chr11",
+    "chr12",
+    "chr13",
+    "chr14",
+    "chr15",
+    "chr16",
+    "chr17",
+    "chr18",
+    "chr19",
+    "chr2",
+    "chr20",
+    "chr21",
+    "chr22",
+    "chr3",
+    "chr4",
+    "chr5",
+    "chr6",
+    "chr7",
+    "chr8",
+    "chr9",
+    "chrX"
+  ],
+  "source_bed_sha256": "13724966c9378c2fd024c62e6bb72b94850e12d96d23a419f60040ae50b98ba3",
+  "exclude_bed": "data/gaps.bed"
+}

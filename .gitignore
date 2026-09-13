@@ -1,0 +1,13 @@
+# Large inputs and outputs: reproducible from the pinned sources in
+# concept_panel.json, too big for git.
+data/
+panel_out/
+acts/
+*.npy
+*.pt
+
+# Environment and caches
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
