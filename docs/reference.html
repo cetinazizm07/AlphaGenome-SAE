@@ -1,0 +1,702 @@
+<title>AlphaGenome SAE Reference</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --ground:#fbfbf9;
+    --panel:#ffffff;
+    --ink:#14171c;
+    --ink-2:#4a5058;
+    --ink-3:#767c85;
+    --rule:#e3e5e4;
+    --rule-strong:#cdd0cf;
+    --conv:#2a78d6;
+    --tower:#eb6834;
+    --ok:#1baf7a;
+    --warn:#b8860b;
+    --accent-wash:#eaf1fb;
+    --warn-wash:#fdf3e0;
+    --code-bg:#f3f4f2;
+    --shadow:0 1px 2px rgba(20,23,28,.05);
+  }
+  :root:not([data-theme="light"]){
+    @media (prefers-color-scheme: dark){
+      --ground:#111316;
+      --panel:#171a1e;
+      --ink:#e9eaea;
+      --ink-2:#adb2b8;
+      --ink-3:#7d838b;
+      --rule:#262a2f;
+      --rule-strong:#363b41;
+      --conv:#6aa5e8;
+      --tower:#f08b5f;
+      --ok:#3fc796;
+      --warn:#d9a441;
+      --accent-wash:#182635;
+      --warn-wash:#2b2313;
+      --code-bg:#1d2126;
+      --shadow:0 1px 2px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#111316;
+    --panel:#171a1e;
+    --ink:#e9eaea;
+    --ink-2:#adb2b8;
+    --ink-3:#7d838b;
+    --rule:#262a2f;
+    --rule-strong:#363b41;
+    --conv:#6aa5e8;
+    --tower:#f08b5f;
+    --ok:#3fc796;
+    --warn:#d9a441;
+    --accent-wash:#182635;
+    --warn-wash:#2b2313;
+    --code-bg:#1d2126;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    font-size:15px;
+    line-height:1.62;
+    margin:0;
+    padding-inline:20px;
+    padding-block:0;
+    -webkit-font-smoothing:antialiased;
+  }
+  .shell{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:212px minmax(0,1fr);gap:44px;align-items:start}
+  @media (max-width:900px){.shell{grid-template-columns:1fr;gap:0}}
+
+  /* ---------- masthead ---------- */
+  header.masthead{grid-column:1/-1;padding-block:52px 26px;border-bottom:1px solid var(--rule-strong)}
+  .eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);margin:0 0 14px}
+  h1{
+    font-family:"Newsreader",Georgia,serif;
+    font-weight:500;font-size:clamp(30px,4.6vw,46px);line-height:1.1;
+    letter-spacing:-.015em;margin:0 0 14px;text-wrap:balance;
+  }
+  .standfirst{font-family:"Newsreader",Georgia,serif;font-size:clamp(16px,2vw,19px);line-height:1.5;color:var(--ink-2);max-width:60ch;margin:0 0 22px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 26px;font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--ink-3)}
+  .meta b{color:var(--ink-2);font-weight:500}
+
+  /* ---------- toc ---------- */
+  nav.toc{position:sticky;top:22px;padding-block:34px;font-size:13px;line-height:1.45}
+  @media (max-width:900px){nav.toc{position:static;padding-block:24px 0;border-bottom:1px solid var(--rule)}}
+  nav.toc h2{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);margin:0 0 12px;font-weight:500}
+  nav.toc ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
+  @media (max-width:900px){nav.toc ol{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px 18px}}
+  nav.toc a{color:var(--ink-2);text-decoration:none;display:flex;gap:9px}
+  nav.toc a:hover{color:var(--conv)}
+  nav.toc a:focus-visible{outline:2px solid var(--conv);outline-offset:2px;border-radius:2px}
+  nav.toc .n{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-3);flex:none;padding-top:1px}
+
+  /* ---------- content ---------- */
+  main{padding-block:34px 90px;min-width:0}
+  section{margin-bottom:52px;scroll-margin-top:20px}
+  h2{
+    font-family:"Newsreader",Georgia,serif;font-weight:500;
+    font-size:26px;line-height:1.2;letter-spacing:-.01em;margin:0 0 6px;text-wrap:balance;
+    display:flex;gap:13px;align-items:baseline;
+  }
+  h2 .n{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--conv);flex:none;letter-spacing:.04em}
+  .dek{color:var(--ink-3);font-size:13.5px;margin:0 0 20px;padding-bottom:14px;border-bottom:1px solid var(--rule)}
+  h3{font-size:14px;font-weight:600;margin:26px 0 8px;letter-spacing:.005em}
+  p{margin:0 0 13px;max-width:68ch}
+  ul,ol.body{margin:0 0 13px;padding-left:20px;max-width:68ch}
+  li{margin-bottom:6px}
+  strong{font-weight:600}
+  code{font-family:"IBM Plex Mono",monospace;font-size:.875em;background:var(--code-bg);padding:.1em .36em;border-radius:3px;word-break:break-word}
+  a{color:var(--conv)}
+
+  /* ---------- tables ---------- */
+  .tw{overflow-x:auto;margin:0 0 16px;border:1px solid var(--rule);border-radius:4px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:8px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+  thead th{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--ink-3);font-weight:500;background:var(--ground);position:sticky;top:0;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  td.num{text-align:right;font-family:"IBM Plex Mono",monospace}
+  th.num{text-align:right}
+  td.mono,.mono{font-family:"IBM Plex Mono",monospace;font-size:12px}
+  .hash{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-2);word-break:break-all}
+
+  /* ---------- notes ---------- */
+  .note{border-left:2px solid var(--rule-strong);padding:2px 0 2px 15px;margin:0 0 16px;max-width:68ch;color:var(--ink-2);font-size:14px}
+  .note.flag{border-left-color:var(--warn);background:var(--warn-wash);padding:12px 15px;border-radius:0 4px 4px 0}
+  .note.key{border-left-color:var(--conv);background:var(--accent-wash);padding:12px 15px;border-radius:0 4px 4px 0}
+  .note .lbl{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;display:block;margin-bottom:5px;color:var(--ink-3)}
+
+  /* ---------- tap chips ---------- */
+  .chip{display:inline-flex;align-items:center;gap:5px;font-family:"IBM Plex Mono",monospace;font-size:11.5px;padding:1px 7px;border-radius:3px;border:1px solid currentColor;line-height:1.7}
+  .chip.conv{color:var(--conv)}
+  .chip.tower{color:var(--tower)}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+
+  /* ---------- status strip ---------- */
+  .status{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:4px;overflow:hidden;margin:0 0 18px}
+  .status div{background:var(--panel);padding:11px 13px}
+  .status .k{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:3px}
+  .status .v{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
+  .status .v small{font-weight:400;color:var(--ink-3);font-size:11.5px}
+
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:4px;padding:13px 15px;overflow-x:auto;margin:0 0 16px;font-size:12.5px;line-height:1.6}
+  pre code{background:none;padding:0;font-size:inherit}
+
+  footer{grid-column:1/-1;border-top:1px solid var(--rule-strong);padding-block:22px 50px;font-size:12.5px;color:var(--ink-3);max-width:68ch}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="shell">
+
+<header class="masthead">
+  <p class="eyebrow">Project reference · frozen design and current state</p>
+  <h1>Sparse Autoencoders on AlphaGenome</h1>
+  <p class="standfirst">Where in a DNA sequence model does regulatory biology get built, and are the features that encode it causal or merely correlated? This is the complete technical and scientific record: every frozen decision, every measured number, every bug that mattered, and everything still open.</p>
+  <div class="meta">
+    <span><b>Repo</b> cetinazizm07/AlphaGenome-SAE (private)</span>
+    <span><b>Code</b> ~5,800 lines · 203 tests</span>
+    <span><b>Design frozen</b> 2026-09-13</span>
+    <span><b>Updated</b> 2026-09-14</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#s1"><span class="n">01</span><span>The question</span></a></li>
+    <li><a href="#s2"><span class="n">02</span><span>Model and port</span></a></li>
+    <li><a href="#s3"><span class="n">03</span><span>Taps</span></a></li>
+    <li><a href="#s4"><span class="n">04</span><span>Train/test separation</span></a></li>
+    <li><a href="#s5"><span class="n">05</span><span>Window manifests</span></a></li>
+    <li><a href="#s6"><span class="n">06</span><span>Concept panel</span></a></li>
+    <li><a href="#s7"><span class="n">07</span><span>The autoencoder</span></a></li>
+    <li><a href="#s8"><span class="n">08</span><span>Extraction</span></a></li>
+    <li><a href="#s9"><span class="n">09</span><span>Training</span></a></li>
+    <li><a href="#s10"><span class="n">10</span><span>Concept matching</span></a></li>
+    <li><a href="#s11"><span class="n">11</span><span>Statistics</span></a></li>
+    <li><a href="#s12"><span class="n">12</span><span>Figures and tracks</span></a></li>
+    <li><a href="#s13"><span class="n">13</span><span>Infrastructure</span></a></li>
+    <li><a href="#s14"><span class="n">14</span><span>Current state</span></a></li>
+    <li><a href="#s15"><span class="n">15</span><span>Open problems</span></a></li>
+    <li><a href="#s16"><span class="n">16</span><span>Bugs that mattered</span></a></li>
+    <li><a href="#s17"><span class="n">17</span><span>Reproducing it</span></a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s1">
+  <h2><span class="n">01</span>The question</h2>
+  <p class="dek">What the study asks and what would count as an answer.</p>
+
+  <p>AlphaGenome predicts hundreds of genomic assay tracks from up to 1,048,576 bp of DNA. It is accurate, and opaque. The project trains sparse autoencoders on its internal activations to decompose those activations into a dictionary of sparse, ideally monosemantic features, then asks two questions of each feature.</p>
+
+  <ul>
+    <li><strong>What does it correspond to?</strong> Each feature is matched against ENCODE's registry of candidate cis-regulatory elements and against annotations derived from GENCODE, giving a per-concept AUROC against a permutation null and a raw-channel baseline.</li>
+    <li><strong>Is it causal?</strong> Features that match a concept get ablated, and the change in the model's own predictions says whether the feature carries the concept or merely travels with it. This arm is designed but not yet run.</li>
+  </ul>
+
+  <p>Three hypotheses shape the tap selection and the concept panel.</p>
+  <div class="tw"><table>
+    <thead><tr><th style="width:58px">ID</th><th>Claim</th><th>How it is tested</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">H1</td><td>Short sequence motifs are built by convolution and need no attention.</td><td>Splice donor and acceptor sites should be recoverable at the conv taps, with a flat depth curve.</td></tr>
+      <tr><td class="mono">H2</td><td>Long-range positional context is built by the transformer tower.</td><td>Distance to the nearest TSS is unavailable inside a 34 bp receptive field but available inside 1 Mb. Its depth curve should rise across the conv/tower boundary.</td></tr>
+      <tr><td class="mono">H3</td><td>Regulatory element classes separate by something other than accessibility.</td><td>pELS and dELS come from the same experimental signal and differ only in TSS distance. If their curves separate, that separation is about position and nothing else.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note flag"><span class="lbl">Voided prior work</span>Every earlier run, pilot and result of this project was discarded on the user's instruction on 2026-09-13 because of technical errors in that work. No number from it is cited here or used as a design constraint. Architecture facts survived only because they were re-verified by reading the installed port's source directly.</div>
+</section>
+
+<section id="s2">
+  <h2><span class="n">02</span>Model and port</h2>
+  <p class="dek">Which AlphaGenome, obtained how, and why PyTorch rather than JAX.</p>
+
+  <p>AlphaGenome's weights have been open since 2026-01-28 under non-commercial model terms. Two code paths exist: the official JAX implementation from Google DeepMind, and a community PyTorch port. This project uses the port.</p>
+
+  <h3>Where the weights and code come from</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Artefact</th><th>Source</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Weights</td><td class="mono">gtca/alphagenome_pytorch</td><td>Hugging Face. <code>model_fold_0..3.safetensors</code> plus <code>model_all_folds</code>, 920 MB each, converted from the official JAX checkpoint.</td></tr>
+      <tr><td>Model code</td><td class="mono">genomicsxai/alphagenome-pytorch</td><td>GitHub. Requires Python ≥ 3.12. Supplies <code>from_pretrained</code>, <code>DtypePolicy</code> and <code>utils.sequence</code>.</td></tr>
+      <tr><td>Not this</td><td class="mono">alphagenome-pytorch</td><td>The PyPI package (0.2.4, lucidrains) is the architecture only. It has no <code>from_pretrained</code>, no safetensors loader. Installing it instead of the fork is the easy mistake.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Why the port and not JAX</h3>
+  <p>The whole study depends on reading intermediate activations, and PyTorch hooks make that a two-line operation where Haiku would require rewriting the forward pass to sow intermediates. The fidelity of the port against JAX outputs was audited in an earlier study and is treated as settled here.</p>
+
+  <h3>Verified architecture</h3>
+  <p>Read from the loaded model, not from documentation. 450.5M parameters.</p>
+  <pre><code>encoder  →  trunk (B, 1536, L/128)  →  + organism embedding
+         →  TransformerTower: 9 blocks, d_model 1536
+         →  embedder_128bp (1536 → 3072)  →  prediction heads</code></pre>
+  <p>The encoder exposes seven intermediate maps keyed by bin size, with channels growing as it downsamples:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Key</th><th class="num">bin (bp)</th><th class="num">channels</th><th>Key</th><th class="num">bin (bp)</th><th class="num">channels</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">bin_size_1</td><td class="num">1</td><td class="num">768</td><td class="mono">bin_size_16</td><td class="num">16</td><td class="num">1280</td></tr>
+      <tr><td class="mono">bin_size_2</td><td class="num">2</td><td class="num">896</td><td class="mono">bin_size_32</td><td class="num">32</td><td class="num">1408</td></tr>
+      <tr><td class="mono">bin_size_4</td><td class="num">4</td><td class="num">1024</td><td class="mono">bin_size_64</td><td class="num">64</td><td class="num">1536</td></tr>
+      <tr><td class="mono">bin_size_8</td><td class="num">8</td><td class="num">1152</td><td colspan="3"></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note key"><span class="lbl">The hook recipe, and why a naive hook fails</span><code>tower.blocks[i]</code> is an <code>nn.ModuleDict</code> with no <code>forward</code>. A plain <code>register_forward_hook</code> on it <strong>never fires, and never warns</strong>. The residual adds live in <code>TransformerTower._forward_block</code>, a plain Python method, so the residual stream is not any module's output. It is <code>mha</code>'s <em>input</em>, captured with <code>register_forward_pre_hook(fn, with_kwargs=True)</code>.</div>
+
+  <p>Each block is a <code>ModuleDict</code> of <code>pair_update</code>, <code>attn_bias</code>, <code>mha</code>, <code>mlp</code>. An older note claimed <code>pair_update</code> exists only on even blocks; that is <strong>wrong for this checkpoint</strong>, where all nine blocks carry it.</p>
+  <p>One more orientation point: <code>embeddings_128bp</code> is head-adjacent, not internal. It is the last shared representation before the prediction heads, the opposite end of the network from the early conv layers the reference study taps.</p>
+</section>
+
+<section id="s3">
+  <h2><span class="n">03</span>Taps</h2>
+  <p class="dek">Six read points spanning depth, and the reasoning behind each.</p>
+
+  <p>A "tap" is a place in the network where activations are captured. The study needs several, because the central question is <em>where</em> a concept is built, and that is only visible as the shape of a curve across depth.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Tap</th><th>Kind</th><th class="num">bin (bp)</th><th class="num">channels</th><th>What it can see</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_4</span></td><td>encoder</td><td class="num">4</td><td class="num">1024</td><td>A short receptive field. Motif scale.</td></tr>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_16</span></td><td>encoder</td><td class="num">16</td><td class="num">1280</td><td>Motif plus immediate flank.</td></tr>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_64</span></td><td>encoder</td><td class="num">64</td><td class="num">1536</td><td>Last conv stage before the tower.</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b0</span></td><td>tower</td><td class="num">128</td><td class="num">1536</td><td>Entering attention, nothing added yet.</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b4</span></td><td>tower</td><td class="num">128</td><td class="num">1536</td><td>Mid-tower.</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b8</span></td><td>tower</td><td class="num">128</td><td class="num">1536</td><td>Last block. Full 1 Mb context available.</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The reference study, <em>Learning monosemantic features in multitask DNA regulatory sequence models via sparse autoencoder decomposition</em> (calico/sae-borzoi), taps Borzoi's <code>conv1d_1</code> through <code>conv1d_4</code>, with receptive fields of 14 to 34 bp. Those are all convolutional. This project keeps three comparable conv taps and adds three tower taps, because the conv-only design cannot answer H2 at all.</p>
+
+  <div class="note"><span class="lbl">The confound this design controls</span>Dictionary width and row budget are held <strong>equal across taps</strong>: H = 8192 features and roughly 8.2M training rows everywhere. If the deeper tap had a bigger dictionary or more data, a rising depth curve would be uninterpretable. See §15 for the way this guarantee partly failed in practice.</div>
+</section>
+
+<section id="s4">
+  <h2><span class="n">04</span>Train/test separation</h2>
+  <p class="dek">Published folds, and the context margin that a naive split gets wrong.</p>
+
+  <p>Claims of the form "the SAE found this on data the backbone never saw" require knowing exactly what the backbone saw. The split is therefore taken from the published fold definition, not invented.</p>
+
+  <h3>Source</h3>
+  <p>Borzoi's <code>sequences_human.bed.gz</code>: 55,497 regions of 196,608 bp, labelled with 8 folds. SHA-256 <span class="hash">13724966c9378c2fd024c62e6bb72b94850e12d96d23a419f60040ae50b98ba3</span></p>
+  <p>Google's <code>fold_intervals.py</code> maps model folds onto those labels:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Model fold</th><th>Validation</th><th>Test</th><th>Held out by this model</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">fold 0</td><td class="mono">fold0</td><td class="mono">fold1</td><td>fold0 ∪ fold1</td></tr>
+      <tr><td class="mono">fold 1</td><td class="mono">fold3</td><td class="mono">fold4</td><td>fold3 ∪ fold4</td></tr>
+      <tr><td class="mono">fold 2</td><td class="mono">fold2</td><td class="mono">fold5</td><td>fold2 ∪ fold5</td></tr>
+      <tr><td class="mono">fold 3</td><td class="mono">fold6</td><td class="mono">fold7</td><td>fold6 ∪ fold7</td></tr>
+    </tbody>
+  </table></div>
+  <p>Those pairs are <strong>disjoint by construction</strong>. No region is held out by more than one model, so there is no common test set and each model fold is evaluated on its own territory. This was also verified empirically: zero overlap between the three folds' held-out windows.</p>
+
+  <div class="note key"><span class="lbl">The context guard</span>A training example <em>predicts</em> 196,608 bp but <em>reads</em> 1,048,576 bp. Anything inside that wider span was seen, even if no loss was computed on it. Training regions are therefore widened by a margin of <strong>425,984 bp</strong> on each side before being subtracted from the held-out territory. Skipping this is the quiet way to leak the backbone's training data into a held-out claim.</div>
+
+  <p>The cost of the guard is about 30 Mb per fold. What survives:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Fold</th><th class="num">Unseen (Mb)</th><th class="num">Seen (Mb)</th><th class="num">Whole 1 Mb windows available</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">fold 0</td><td class="num">661.2</td><td class="num">2089.0</td><td class="num">590</td></tr>
+      <tr><td class="mono">fold 1</td><td class="num">664</td><td class="num">—</td><td class="num">594</td></tr>
+      <tr><td class="mono">fold 2</td><td class="num">649</td><td class="num">—</td><td class="num">571</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="s5">
+  <h2><span class="n">05</span>Window manifests</h2>
+  <p class="dek">What gets read, in what split, with gaps excluded.</p>
+
+  <p>Each fold gets 1,600 windows of 1,048,576 bp across 23 chromosomes, drawn without replacement in a fixed random order.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Split</th><th class="num">Windows</th><th>Territory</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">train</td><td class="num">1000</td><td>seen by backbone</td><td>SAE training rows. 1000 × 8192 ≈ 8.2M.</td></tr>
+      <tr><td class="mono">val</td><td class="num">100</td><td>seen</td><td>Checkpoint selection by FVU.</td></tr>
+      <tr><td class="mono">test_trained</td><td class="num">200</td><td>seen</td><td>Size-matched control. The test vs test_trained gap measures backbone memorisation.</td></tr>
+      <tr><td class="mono">dev</td><td class="num">100</td><td>unseen</td><td>The only split tuning may look at.</td></tr>
+      <tr><td class="mono">test</td><td class="num">200</td><td>unseen</td><td>Locked. Read once, after every choice is frozen.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Assembly gaps</h3>
+  <p>GRCh38 models centromeres and telomeres as long runs of N. A scan of the primary assembly with a 1,000 bp minimum found <strong>366 gaps totalling 151.0 Mb</strong>, of which 150.6 Mb sit on chr1–22, X and Y. Those regions are subtracted from both territories before tiling.</p>
+  <p>Verified: <strong>0 of 4,800 windows</strong> overlap a gap; without the exclusion, one would have. Shorter N runs survive and are handled at the bin level instead — a sampled check found ambiguous bases in 2 of 100 windows, costing exactly 1 row in 1,310,719 during a pilot, so the equal-row-budget claim holds to a rounding error.</p>
+  <p>That gap file is reused as a landmark source: the widest gap on a chromosome is its centromere, which is what the browser figure's ideogram draws.</p>
+</section>
+
+<section id="s6">
+  <h2><span class="n">06</span>Concept panel</h2>
+  <p class="dek">Eleven concepts in five roles, every source pinned by checksum, frozen before any run.</p>
+
+  <div class="note"><span class="lbl">Why freezing matters</span>Roles are fixed before results exist. Changing a concept's role after seeing its number turns an exploratory finding into a confirmatory claim it never was.</div>
+
+  <h3>Sources</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Source</th><th class="num">Bytes</th><th>MD5</th></tr></thead>
+    <tbody>
+      <tr><td>ENCODE cCRE registry<br><span class="mono">ENCSR487PRC / ENCFF234XEZ</span></td><td class="num">15,344,989</td><td class="hash">dbb963a08dfe7e489c746e38448adae7</td></tr>
+      <tr><td>GENCODE v50 basic GTF</td><td class="num">79,970,394</td><td class="hash">11e77cf1d4b78b43f57d608e3f7f2202</td></tr>
+      <tr><td>GRCh38 primary assembly FASTA</td><td class="num">845,635,028</td><td class="hash">da1a11258be075cfa7af718162c894e7</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note flag"><span class="lbl">Column trap</span>ENCFF234XEZ is BED9+1. The class labels are in <strong>column index 9</strong> (comma-separated, e.g. <code>pELS,CTCF-bound</code>). <code>read_ccre_bed</code> defaults to column 5, which is wrong for this file. Always pass <code>--class-column 9</code>.</div>
+
+  <h3>The eleven concepts, as built</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Concept</th><th>Role</th><th class="num">Intervals</th><th class="num">Covered (Mb)</th><th>Derivation</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">cCRE_PLS</td><td>primary</td><td class="num">40,734</td><td class="num">11.71</td><td>Promoter-like</td></tr>
+      <tr><td class="mono">cCRE_pELS</td><td>primary</td><td class="num">171,292</td><td class="num">44.13</td><td>Proximal enhancer-like</td></tr>
+      <tr><td class="mono">cCRE_dELS</td><td>primary</td><td class="num">786,756</td><td class="num">218.28</td><td>Distal enhancer-like</td></tr>
+      <tr><td class="mono">cCRE_CTCF-only</td><td>primary</td><td class="num">35,825</td><td class="num">9.10</td><td>CTCF without enhancer or promoter signal</td></tr>
+      <tr><td class="mono">cCRE_DNase-H3K4me3</td><td>primary</td><td class="num">25,899</td><td class="num">6.90</td><td>Rarest class. Marginal power at 200 test windows.</td></tr>
+      <tr><td class="mono">cCRE_any</td><td>primary</td><td class="num">1,060,118</td><td class="num">290.12</td><td>Specificity control. A feature scoring as high here as on one class is detecting accessible chromatin.</td></tr>
+      <tr><td class="mono">splice_donor</td><td>local · H1</td><td class="num">348,750</td><td class="num">7.07</td><td>Intron start (+) / end (−), ±10 bp</td></tr>
+      <tr><td class="mono">splice_acceptor</td><td>local · H1</td><td class="num">350,985</td><td class="num">7.19</td><td>Intron end (+) / start (−), ±10 bp</td></tr>
+      <tr><td class="mono">TSS_within_2kb</td><td>contextual · H2</td><td class="num">69,729</td><td class="num">325.04</td><td>Transcript start ±2 kb. The cleanest conv/tower separator in the panel.</td></tr>
+      <tr><td class="mono">GC_rich</td><td>positive control</td><td class="num">2,528,598</td><td class="num">771.03</td><td>Top GC quartile per chromosome. <strong>Must</strong> clear the null at every tap; if not, the pipeline is broken, not the model.</td></tr>
+      <tr><td class="mono">shuffled_dELS</td><td>negative control</td><td class="num">727,860</td><td class="num">209.99</td><td>dELS relocated at random within the chromosome. <strong>Must</strong> sit at the null ceiling.</td></tr>
+    </tbody>
+  </table></div>
+  <p>shuffled_dELS has 7.5% fewer intervals than dELS because uniformly relocated intervals collide and merge at that density. That is expected arithmetic, not a defect.</p>
+  <p>Deliberately excluded: RepeatMasker families (UCSC checksum could not be pinned), the ENCODE blacklist (portal search returned nothing), and per-biosample cCREs (AlphaGenome sees only sequence, so a cell-type-specific label is largely unpredictable from its input).</p>
+</section>
+
+<section id="s7">
+  <h2><span class="n">07</span>The autoencoder</h2>
+  <p class="dek">The published core, vendored unmodified, with a thin loop around it.</p>
+
+  <p>The SAE maths is taken byte-for-byte from the reference study rather than reimplemented, so the recipe under test is the published one.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Item</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Source file</td><td class="mono">calico/sae-borzoi · core/sae.py</td></tr>
+      <tr><td>Commit</td><td class="hash">2839eeb05be2e827fa9b0aeb83bdcd4735226522</td></tr>
+      <tr><td>SHA-256 of the file</td><td class="hash">a5e09f1c834c88004913ccf7ae798dfd73e1559667fb1505509a509fff7f8d00</td></tr>
+      <tr><td>Licence</td><td>MIT, shipped alongside</td></tr>
+      <tr><td>Modification</td><td>Imports reduced. Class bodies untouched.</td></tr>
+    </tbody>
+  </table></div>
+  <p>SAELens was considered and rejected: it imposes its own normalisation and initialisation conventions, which would mean no longer running the reference recipe.</p>
+
+  <h3>Recipe</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Parameter</th><th>Value</th><th>Provenance</th></tr></thead>
+    <tbody>
+      <tr><td>Dictionary width H</td><td class="mono">8192</td><td>Ours. Fixed across taps so depth is not confounded by width.</td></tr>
+      <tr><td>Sparsity</td><td class="mono">topk 5% → k = 409</td><td>Reference</td></tr>
+      <tr><td>Learning rate</td><td class="mono">1e-5</td><td>Reference</td></tr>
+      <tr><td>Loss</td><td class="mono">MSE, no L1</td><td>Reference</td></tr>
+      <tr><td>Normalisation</td><td>per-channel max from the train split, then per-token LayerNorm</td><td>Reference</td></tr>
+      <tr><td>Optimiser</td><td class="mono">Adam, β (0.9, 0.999), ε 1e-8, no weight decay, constant LR</td><td>Reference</td></tr>
+      <tr><td>Batch</td><td class="mono">16,384 tokens, microbatch 1,024</td><td>Ours</td></tr>
+      <tr><td>Steps</td><td class="mono">6000</td><td><strong>Ours</strong> — see below</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note flag"><span class="lbl">The step budget is ours, not the reference's</span>The vendored repository contains the model class, not a training loop, so no published step count exists. 6000 was chosen from a measured pilot: on one tap at 1/12.5 scale, validation FVU was 1.01 at step 100, 0.41 at 1000, and <strong>0.234 at 3000 and still falling about 3% per 100 steps</strong>. The budget is part of the recipe and the recipe is part of the resume identity, so <strong>it cannot be raised after the fact</strong> — changing it means retraining from scratch, and all three folds must share it to stay comparable.</div>
+
+  <p>AuxK, the standard remedy for dead latents, is deliberately <em>not</em> in the recipe. If used, it enters as a separately labelled arm, never as an edit to the vendored core.</p>
+</section>
+
+<section id="s8">
+  <h2><span class="n">08</span>Extraction</h2>
+  <p class="dek">One forward pass, six taps, measured cost.</p>
+
+  <p><code>ag_sae/extract.py</code> installs all hooks once, runs each window through <code>model.encode</code> a single time, and captures every tap from that one pass. Positions are sampled randomly rather than on a stride, because a stride can align with periodic features and the SAE sees rows independently anyway.</p>
+
+  <div class="status">
+    <div><span class="k">Peak GPU</span><span class="v">15.26 <small>GiB</small></span></div>
+    <div><span class="k">of L4's</span><span class="v">23 <small>GiB</small></span></div>
+    <div><span class="k">Per window</span><span class="v">137 <small>MB</small></span></div>
+    <div><span class="k">Per fold</span><span class="v">219 <small>GB</small></span></div>
+    <div><span class="k">Rows, fold 0</span><span class="v">78.6 <small>M</small></span></div>
+  </div>
+
+  <p>Storage is float16. That is safe with room to spare: the largest absolute activation measured on real shards was about 167, against float16's ceiling of 65,504. Extraction refuses to write a shard containing a non-finite value, so an overflow would fail loudly rather than silently.</p>
+
+  <h3>Resumability</h3>
+  <p><code>index.json</code> is rewritten after every shard and records the shards already done, guarded by an identity check on the manifest and settings. On a spot preemption the run resumes from the last finished shard, costing at most 8 windows.</p>
+
+  <div class="note"><span class="lbl">Timing, corrected</span>An early estimate of 7.75 s per window, taken from a 16-window trial, predicted 3.5 h per fold. The real figure at full scale was <strong>9.75 h</strong>, about 2.8× the estimate. Budget roughly <strong>19 h per fold</strong> end to end, or 57 h for three.</div>
+</section>
+
+<section id="s9">
+  <h2><span class="n">09</span>Training</h2>
+  <p class="dek">Step-budgeted, identity-checked, exactly resumable.</p>
+
+  <p><code>ag_sae/train.py</code> trains one SAE on one tap of one fold. Per fold that is 6 taps × 3 seeds = <strong>18 runs</strong>; across three folds, <strong>54</strong>. Three seeds because sparse autoencoders depend on initialisation, and a feature found by one seed may be that seed's artefact.</p>
+
+  <p>Scales are computed from the training split only; using validation would leak its distribution into the model. Checkpointing is every 100 steps, and the best checkpoint is kept by validation FVU.</p>
+
+  <h3>Resume identity</h3>
+  <p>A resume is refused unless everything matches: the recipe, hashes of the training and validation shard sets, the torch and numpy versions, the device type, and the SHA-256 of <code>train.py</code>, <code>sae.py</code> and the vendored core. Two consequences worth internalising:</p>
+  <ul>
+    <li>Editing any of those source files mid-campaign makes every in-progress run refuse to resume. That is the intended behaviour — loud, not silent.</li>
+    <li><code>run_fold.sh</code> is read incrementally by bash while it runs, so editing it during a run can corrupt execution. Leave it alone until the fold finishes.</li>
+  </ul>
+
+  <p>Two checkpoint files are written per run. <code>latest.pt</code> carries Adam state for resuming, around 300 MB, and is excluded from the Drive archive. <code>best.pt</code> carries only what analysis needs and is the file that gets archived and loaded by the matcher.</p>
+</section>
+
+<section id="s10">
+  <h2><span class="n">10</span>Concept matching</h2>
+  <p class="dek">Frozen SAE in, per-concept AUROC out, against a null that respects the genome's structure.</p>
+
+  <p><code>ag_sae/concepts.py</code> is deliberately decoupled from training. Concept matching must never reach checkpoint selection, or the independence claim collapses.</p>
+
+  <h3>AUROC under extreme sparsity</h3>
+  <p>Under TopK most bins score exactly zero, so ties are the common case, not an edge case. Ties get half credit, as the Mann-Whitney definition requires. Ignoring them gives the wrong answer for almost every feature.</p>
+  <pre><code>a = number of positive bins that fire
+wins = a·(negative zeros) + 0.5·(positive zeros)·(negative zeros)
+     + rank sum over firing positives − a(a+1)/2
+AUROC = wins / (n_pos · n_neg)</code></pre>
+  <p>Ranks are invariant under label permutation, so they are computed once and reused across permutations. That took the null calibration from 27 minutes to 24 seconds at 1 Mb scale.</p>
+
+  <h3>The null</h3>
+  <p>Labels are circularly shifted <strong>within contiguous runs of bins</strong>, and the statistic taken is the maximum over the dictionary. Two properties matter:</p>
+  <ul>
+    <li>Shifting inside runs preserves each concept's spatial clustering. Adjacent bins are strongly correlated; a null that destroys that structure is far too permissive.</li>
+    <li>Taking the max over the dictionary in the null matches the max taken in the observed statistic, so the multiplicity of searching 8192 features is absorbed rather than ignored.</li>
+  </ul>
+
+  <div class="note flag"><span class="lbl">Grid trap, now guarded</span>Runs are found by comparing the gap between bins to <code>bin_bp</code>. Matching a conv tap (4, 16 or 64 bp bins) with the old 128 bp default made every bin its own run, the shift became the identity, the null equalled the observed statistic, and <strong>nothing was ever called recovered</strong> — silently. The bin width is now read from the coordinates file and a mismatched explicit value raises.</div>
+
+  <h3>Scale note</h3>
+  <p>In a single 1 Mb region, PLS has roughly 12 elements, which pushes the null ceiling to about 0.62. Locus-level inspection works at that size; AUROC statistics do not. Matching runs on the full test split, not one window.</p>
+</section>
+
+<section id="s11">
+  <h2><span class="n">11</span>Statistics</h2>
+  <p class="dek">What each question needs, what the data cannot support, and what not to use.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Question</th><th>Method</th></tr></thead>
+    <tbody>
+      <tr><td>Is the concept recovered at this tap?</td><td>The circular-shift permutation test above. Already the right instrument; nothing to add.</td></tr>
+      <tr><td>Does the SAE beat raw channels?</td><td>Needs both sides calibrated against their own null. See the flag below.</td></tr>
+      <tr><td>Does the tower add anything?</td><td>Bootstrap over <em>windows</em>, not bins, within each fold. Consistency of direction across folds as a pre-declared criterion.</td></tr>
+      <tr><td>Do seeds agree?</td><td>Descriptive. Best cosine match between dictionaries, against a random-direction null.</td></tr>
+      <tr><td>Is a feature causal?</td><td>Paired permutation on ablation differences, clustered by window, with FDR across features — and a frequency- and magnitude-matched random-feature control.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note flag"><span class="lbl">Open confound in the current code</span>The null is computed only on the SAE codes. The raw-channel baseline is reported uncalibrated, so <code>sae_minus_raw</code> compares a maximum over 8192 features against a maximum over 2 × d_in channels — 8192 vs 3072 at the tower taps, 8192 vs 2048 at <code>bin_size_4</code>. More candidates give a higher maximum even under pure noise, so the difference is biased toward the SAE by an amount of the same order as the effects being reported. <strong>Fix before reporting</strong>: run the same permutations on the raw channels and compare calibrated excesses.</div>
+
+  <div class="note"><span class="lbl">What three folds cannot do</span>A sign test with n = 3 has a one-sided floor of p = 0.125. No fold-level result can be "significant" no matter how clean it is. Fold agreement is qualitative replication and must be reported as such. Seeds are not biological replicates either — they measure optimisation noise, so take a median within fold and show the spread as a robustness band.</div>
+
+  <p><strong>Multiplicity.</strong> 6 taps × 11 concepts × 3 folds is roughly 200 primary comparisons. Benjamini–Hochberg is appropriate, with the family declared in advance; controls are diagnostics and do not join the family. At q = 0.05 over 200 tests the smallest threshold is about 2.5 × 10⁻⁴, which 200 permutations cannot resolve — the floor is around 0.005. Either raise permutations into the thousands, or fit an extreme-value tail to the permutation maxima, which is standard for max-statistics and far cheaper.</p>
+
+  <p><strong>A hierarchical Bayesian layer is a reasonable addition</strong> for the aggregate questions, not a replacement for the permutation test. It handles the n = 3 problem coherently, separates seed variance from fold variance explicitly, and its shrinkage does the multiplicity work that BH does by thresholding. Priors would need freezing alongside the panel. Do not attempt a bin-level Bayesian model: millions of autocorrelated bins would need a spatial Gaussian process, which is a separate research project.</p>
+
+  <p><strong>Not to be used:</strong> chi-square or Fisher on bin counts, t-tests across bins, bin-level Pearson correlation, binomial tests on overlap counts. All assume independent bins. Neighbouring bins are strongly correlated and these inflate significance badly. This is the single most common statistical error in this corner of genomics. Note the nuance: Fisher is not wrong in general — on discrete, well-separated units such as seqlets or motif hits it is perfectly defensible, and the reference study's own code contains no Fisher test at all, delegating motif statistics to MEME E-values and TOMTOM, with a bedtools-based control for seqlet overlaps.</p>
+</section>
+
+<section id="s12">
+  <h2><span class="n">12</span>Figures and tracks</h2>
+  <p class="dek">Nine publication figures, plus the same numbers in browser formats.</p>
+
+  <p>Every figure writes PDF, SVG, 300 dpi PNG and a CSV of the numbers behind it. The CSV is required rather than convenient: three palette slots fall below 3:1 contrast on white, and the rule is that colour always ships with a table view. SVG keeps text as text and PDF uses Type 42 fonts, so both open editable in Illustrator.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Figure</th><th>Question it answers</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">recovery</td><td>Which concepts are recovered, and by how much do they beat the raw channels? Dumbbell, so the reader does not have to subtract.</td></tr>
+      <tr><td class="mono">depth</td><td>Where is each concept built? Small multiples, one panel per concept, with the conv/tower rule drawn.</td></tr>
+      <tr><td class="mono">locus</td><td>What does one feature do along the genome, against the annotation? One lane per cCRE class.</td></tr>
+      <tr><td class="mono">specificity</td><td>Are features concentrated on one concept or spread across many? ECDF, with a chance line.</td></tr>
+      <tr><td class="mono">pareto</td><td>Reconstruction against sparsity. TopK pins L0 to k, so the function detects a constant L0 and puts depth on the x axis instead, drawing a true frontier only for a real sweep.</td></tr>
+      <tr><td class="mono">feature_card</td><td>One feature on one page: logo of its strongest sites, activation histogram, <strong>a second logo drawn evenly across the firing range</strong>, and concept AUROC measured from chance.</td></tr>
+      <tr><td class="mono">seed_stability</td><td>How much of the dictionary survives a change of seed, against a random-direction null.</td></tr>
+      <tr><td class="mono">browser</td><td>IGV-style: chromosome ideogram with the window marked, feature tracks, cCRE and gene lanes, one shared coordinate ruler.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note key"><span class="lbl">Why the feature card has two logos</span>Showing only the strongest sites makes any feature look monosemantic. The second logo samples the firing range evenly. If the two disagree, the feature is not monosemantic no matter how clean its top examples look. This is the interpretability illusion, and the figure exists to expose it.</div>
+
+  <p>Logos are drawn with logomaker, in the project's validated base colours, with <code>stack_order="big_on_top"</code> — readers take the top letter of a stack as the consensus, so inverting the order inverts the reading.</p>
+
+  <p><code>ag_sae/tracks.py</code> writes activations as bedGraph and intervals as BED, plus an igv.js session dictionary. IGV desktop, igv-notebook and UCSC all read those. The viewer is never a dependency: <code>tracks.show</code> imports igv-notebook lazily. bedGraph rather than BigWig because BigWig needs a compiled writer and one value per 128 bp bin is small enough as text; zero rows are dropped because under TopK most bins are exactly zero.</p>
+</section>
+
+<section id="s13">
+  <h2><span class="n">13</span>Infrastructure</h2>
+  <p class="dek">Where it runs, what it costs, and how results get archived.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Component</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>Project / VM</td><td class="mono">alphagenome-sae / alphagenome-run</td></tr>
+      <tr><td>Machine</td><td>g2-standard-8, NVIDIA L4 23 GB, us-east1-c, <strong>spot</strong></td></tr>
+      <tr><td>Boot disk</td><td>97 GB (57 GB is CUDA and system libraries, not reclaimable)</td></tr>
+      <tr><td>Data disk</td><td class="mono">ag-data</td></tr>
+      <tr><td>Environment</td><td>uv-built Python 3.12 venv at <code>~/ag/.venv</code>, torch from the cu129 index</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The data disk is 400 GB pd-balanced, ext4, mounted at <code>/mnt/ag</code> with a <code>nofail</code> fstab entry so a spot restart cannot block boot. That size was set by quota, not preference: in us-east1 <code>SSD_TOTAL_GB</code> is 500 with 100 already used by the boot disk, leaving 400; <code>DISKS_TOTAL_GB</code> (HDD) is 4096 and unused. HDD was rejected because training reads shards repeatedly.</p>
+
+  <h3>Archiving</h3>
+  <p>Activations go to Google Drive rather than being deleted. Measured upload is <strong>139 MB/s</strong>, so a 219 GB fold takes about 27 minutes, and <code>rclone check</code> verifies against Drive's MD5. <strong>Nothing is deleted that has not verified.</strong> After verification only <code>train</code>, <code>val</code> and <code>test_trained</code> shards are removed; <code>test</code> and <code>dev</code> stay on disk so concept matching does not require pulling 219 GB back. Peak disk under that policy is about 304 GB of 381 GB during fold 2.</p>
+
+  <p>Two cautions. Drive enforces a 750 GB/day upload cap, and three folds total roughly 657 GB — a 57 h campaign spans more than a day, so it should not bite, but a re-upload could. And GCE-to-Drive traffic may be billed as internet egress at roughly $0.12/GB, which would be around $79 for three folds; this is unverified and worth checking on the billing console after the first fold. A same-region Cloud Storage bucket would avoid both and cost far less.</p>
+
+  <div class="note"><span class="lbl">Operational gotcha</span><code>pkill -f tensorboard</code> inside a <code>gcloud compute ssh --command</code> string matches the SSH command's own process and kills the session before anything after it runs. Use <code>pkill -f "[t]ensorboard"</code>.</div>
+</section>
+
+<section id="s14">
+  <h2><span class="n">14</span>Current state</h2>
+  <p class="dek">Fold 0 in progress. Provisional numbers, and what they already tell us.</p>
+
+  <div class="status">
+    <div><span class="k">Folds complete</span><span class="v">0 <small>of 3</small></span></div>
+    <div><span class="k">Fold 0 extraction</span><span class="v">done</span></div>
+    <div><span class="k">Fold 0 SAEs</span><span class="v">13 <small>of 18</small></span></div>
+    <div><span class="k">Rows extracted</span><span class="v">78.6 <small>M</small></span></div>
+    <div><span class="k">Archived to Drive</span><span class="v">none <small>yet</small></span></div>
+  </div>
+
+  <p>Folds 1 and 2 have not started. <code>run_fold.sh</code> handles one fold and stops; the other two need separate invocations.</p>
+
+  <h3>Fold 0 reconstruction, completed runs</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Tap</th><th class="num">FVU (3 seeds)</th><th class="num">Dead latents</th><th class="num">Dictionary used</th><th class="num">Minutes / run</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_4</span></td><td class="num">0.197 / 0.201 / 0.199</td><td class="num">~1,920</td><td class="num">0.77</td><td class="num">24</td></tr>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_16</span></td><td class="num">0.198 / 0.199 / 0.200</td><td class="num">~1,160</td><td class="num">0.86</td><td class="num">29</td></tr>
+      <tr><td><span class="chip conv"><span class="dot"></span>bin_size_64</span></td><td class="num">0.177 / 0.176 / 0.176</td><td class="num">~470</td><td class="num">0.94</td><td class="num">34</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b0</span></td><td class="num">0.196 / 0.198 / 0.197</td><td class="num">~2,560</td><td class="num">0.69</td><td class="num">34</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b4</span></td><td class="num">0.196 (seed 0)</td><td class="num">~4,850</td><td class="num">0.41</td><td class="num">~40</td></tr>
+      <tr><td><span class="chip tower"><span class="dot"></span>resid_pre_b8</span></td><td class="num">pending</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Two things are already clear. <strong>6000 steps was the right call</strong>: FVU lands at 0.18–0.20, clearly better than the pilot's 0.234 at 3000. And <strong>seed variance is tiny</strong> — differences appear in the third decimal — which means three seeds are ample and all the uncertainty in the final result will come from fold-to-fold variation. That is exactly the variance decomposition a hierarchical model would report, readable here directly.</p>
+
+  <p>No concept matching has been run on real data. Every figure produced so far comes from synthetic data and exists only to check layout.</p>
+</section>
+
+<section id="s15">
+  <h2><span class="n">15</span>Open problems</h2>
+  <p class="dek">Known, unresolved, and consequential.</p>
+
+  <h3>Dead latents break the equal-dictionary guarantee</h3>
+  <p>The design holds H = 8192 constant across taps so that the depth comparison is not confounded by dictionary size. The <em>nominal</em> width is constant. The <em>effective</em> width is not, and it varies along exactly the axis under comparison:</p>
+  <div class="tw"><table>
+    <thead><tr><th>Tap</th><th class="num">Dead</th><th class="num">Effective dictionary</th></tr></thead>
+    <tbody>
+      <tr><td class="mono">bin_size_64</td><td class="num">~470</td><td class="num">~7,720</td></tr>
+      <tr><td class="mono">bin_size_16</td><td class="num">~1,160</td><td class="num">~7,030</td></tr>
+      <tr><td class="mono">bin_size_4</td><td class="num">~1,920</td><td class="num">~6,270</td></tr>
+      <tr><td class="mono">resid_pre_b0</td><td class="num">~2,560</td><td class="num">~5,630</td></tr>
+      <tr><td class="mono">resid_pre_b4</td><td class="num">~4,850</td><td class="num">~3,340</td></tr>
+    </tbody>
+  </table></div>
+  <p>A 2.3× spread. The mitigating fact is that the best-of-dictionary null takes its maximum over the same effective dictionary, so <em>calibrated</em> AUROC comparisons remain fair. What does not survive is the sentence "we learned a dictionary of 8192 features": at <code>resid_pre_b4</code> roughly 3,340 were learned. AuxK is the standard remedy and is already planned as a separate labelled arm.</p>
+
+  <h3>Uncalibrated raw baseline</h3>
+  <p>Described in §11. This must be fixed before any SAE-versus-raw number is reported.</p>
+
+  <h3>Permutation resolution</h3>
+  <p>200 permutations cannot support FDR correction across roughly 200 comparisons. Raise the count or fit an extreme-value tail.</p>
+
+  <h3>Not yet built</h3>
+  <ul>
+    <li>The ablation arm. Designed in outline only; the matched random-feature control is the load-bearing piece.</li>
+    <li>Motif analysis. The reference study's MEME and TOMTOM path has no counterpart here yet.</li>
+    <li>Folds 1 and 2.</li>
+  </ul>
+</section>
+
+<section id="s16">
+  <h2><span class="n">16</span>Bugs that mattered</h2>
+  <p class="dek">Each one would have produced plausible, wrong results. Kept here so they are not reintroduced.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th style="width:26%">Bug</th><th>What it would have done</th><th>Found by</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ddof mismatch</strong></td><td>The matcher normalised with numpy's default <code>ddof=0</code> while torch uses <code>correction=1</code>, silently rescaling every code and therefore every AUROC.</td><td>A round-trip test between the training and analysis paths.</td></tr>
+      <tr><td><strong>rankdata keeps float16</strong></td><td>scipy preserves the input dtype. On float16 shards, ranks lose integer precision above 2048 and their sum overflows to infinity, making <em>every</em> raw-channel baseline NaN.</td><td>Running the real pipeline on real shards.</td></tr>
+      <tr><td><strong>bin_bp default</strong></td><td>On a conv tap, the 128 bp default made every bin its own run, so the circular shift became the identity and nothing was ever called recovered.</td><td>Reading the code during a pre-flight audit.</td></tr>
+      <tr><td><strong>Randomised <code>hash()</code></strong></td><td>Python randomises string hashing per process, so it cannot seed reproducible position sampling. Runs were not reproducible.</td><td>A reproducibility test. Replaced with <code>zlib.crc32</code>.</td></tr>
+      <tr><td><strong><code>np.save</code> appends .npy</strong></td><td>Broke the atomic temp-file-then-rename write, so shards could be left half-written.</td><td>A test on the atomic write.</td></tr>
+      <tr><td><strong>Rank recomputation</strong></td><td>Not wrong, but 27 minutes per null calibration instead of 24 seconds. Ranks are permutation-invariant and are now computed once.</td><td>Profiling.</td></tr>
+      <tr><td><strong>conv/tower by position</strong></td><td>A figure classified taps by their index in the passed subset rather than their identity, so a tower-only call coloured everything convolutional.</td><td>Looking at the rendered figure.</td></tr>
+      <tr><td><strong>Truncated bar axis</strong></td><td>Concept AUROC bars grew from the axis edge instead of from chance, exaggerating small differences.</td><td>Looking at the rendered figure.</td></tr>
+      <tr><td><strong>Logo stack order</strong></td><td>Largest letter at the bottom inverts how a sequence logo is read.</td><td>Looking at the rendered figure.</td></tr>
+      <tr><td><strong>Resume guard</strong></td><td>The runner skipped extraction whenever <code>index.json</code> merely existed, so a preempted partial run would have been accepted as complete.</td><td>Reading <code>run_extraction</code> instead of assuming.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note"><span class="lbl">Pattern worth noting</span>Four of these were invisible to the test suite and were caught only by rendering a figure and looking at it, or by running the real pipeline on real data. Tests verify contracts; they do not verify that a picture is readable or that a dtype survives a round trip through disk.</div>
+</section>
+
+<section id="s17">
+  <h2><span class="n">17</span>Reproducing it</h2>
+  <p class="dek">From an empty machine to a trained fold.</p>
+
+  <h3>Inputs</h3>
+  <pre><code># genome, annotation, cCRE registry — verify every md5 against §06
+curl -sL -O https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/GRCh38.primary_assembly.genome.fa.gz
+curl -sL -O https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/gencode.v50.basic.annotation.gtf.gz
+curl -sL -O https://www.encodeproject.org/files/ENCFF234XEZ/@@download/ENCFF234XEZ.bed.gz
+gunzip -k GRCh38.primary_assembly.genome.fa.gz</code></pre>
+
+  <h3>Manifests and panel</h3>
+  <pre><code>python -m ag_sae.windows gaps --fasta data/GRCh38.primary_assembly.genome.fa \
+    --out data/gaps.bed
+
+python -m ag_sae.windows build --bed data/sequences_human.bed.gz \
+    --exclude data/gaps.bed --out manifests --folds 0 1 2 \
+    --window-bp 1048576 --test-windows 200 --dev-windows 100 \
+    --train-windows 1000 --val-windows 100
+
+python -m ag_sae.panel --panel concept_panel.json \
+    --encode-ccre data/ENCFF234XEZ.bed.gz \
+    --gencode-gtf data/gencode.v50.basic.annotation.gtf.gz \
+    --genome-fasta data/GRCh38.primary_assembly.genome.fa.gz \
+    --chrom-sizes data/GRCh38.chrom.sizes \
+    --exclude data/gaps.bed --out panel_out</code></pre>
+  <p>Note the panel takes the <em>gzipped</em> FASTA, because that is the file whose md5 is pinned. Extraction takes the uncompressed one, because a plain <code>.gz</code> cannot be seeked.</p>
+
+  <h3>Environment on the VM</h3>
+  <pre><code>uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python \
+    --index-url https://download.pytorch.org/whl/cu129 torch
+uv pip install --python .venv/bin/python \
+    numpy pandas pyarrow scipy safetensors huggingface_hub pyfaidx
+uv pip install --python .venv/bin/python --no-deps \
+    "git+https://github.com/genomicsxai/alphagenome-pytorch.git"
+uv pip install --python .venv/bin/python \
+    einops einx assoc-scan rotary-embedding-torch hyper-connections</code></pre>
+
+  <h3>One fold, end to end</h3>
+  <pre><code>cd ~/ag && nohup ./run_fold.sh 0 > /mnt/ag/fold0.out 2>&1 &
+
+# progress, at any time
+bash ~/ag/status.sh 0</code></pre>
+  <p>The runner fetches the fold weights if absent, extracts, trains 18 SAEs, uploads checkpoints and activations, verifies with <code>rclone check</code>, and only then frees the archived splits. Any failure aborts before the upload or the delete, so nothing unverified is ever removed.</p>
+
+  <h3>Figures from synthetic data</h3>
+  <pre><code>PYTHONPATH=. python examples/make_examples.py</code></pre>
+  <p>Renders all nine figures plus loadable browser tracks into <code>~/Desktop/ag_sae_figure_examples</code>. Every number there is invented; it exists to check layout, never to be read as a result.</p>
+</section>
+
+</main>
+
+<footer>
+  <p>Compiled 2026-09-14 from the frozen design, the committed source, and measurements taken on the running campaign. Where a number here came from an estimate rather than a measurement, it says so. Fold 0 is still training; every result in §14 is provisional and no concept matching has yet been run on real activations.</p>
+</footer>
+
+</div>
