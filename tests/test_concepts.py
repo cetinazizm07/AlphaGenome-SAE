@@ -158,32 +158,77 @@ def test_directed_folds_and_reports_direction():
 # --- null -----------------------------------------------------------------
 
 
-def test_runs_split_at_gaps_and_chromosome_changes():
-    bins = pd.concat([
-        C.bin_grid("chr1", 0, 512, 128),      # 4 adjacent bins
-        C.bin_grid("chr1", 1024, 1280, 128),  # gap, then 2 more
-        C.bin_grid("chr2", 0, 256, 128),
-    ], ignore_index=True)
-    runs = C.contiguous_runs(bins, 128)
-    assert sorted(len(r) for r in runs) == [2, 2, 4]
+def test_shift_moves_intervals_and_keeps_their_shape():
+    spans = np.array([[10, 20], [40, 50]], dtype=np.int64)
+    moved = C.shift_intervals(spans, 0, 100, offset=25)
+    assert moved.tolist() == [[35, 45], [65, 75]]
+    # Count, widths and the gap between elements all survive.
+    assert (moved[:, 1] - moved[:, 0]).tolist() == [10, 10]
+    assert moved[1, 0] - moved[0, 0] == spans[1, 0] - spans[0, 0]
 
 
-def test_circular_null_preserves_label_counts_and_clustering():
+def test_shift_wraps_at_the_far_edge():
+    spans = np.array([[90, 100]], dtype=np.int64)
+    moved = C.shift_intervals(spans, 0, 100, offset=5)
+    # Crosses the end, so it returns as two pieces with the same total length.
+    assert (moved[:, 1] - moved[:, 0]).sum() == 10
+    assert moved[:, 0].min() >= 0 and moved[:, 1].max() <= 100
+
+
+def test_shift_is_a_no_op_at_zero_offset():
+    spans = np.array([[10, 20], [40, 50]], dtype=np.int64)
+    assert C.shift_intervals(spans, 0, 100, 0).tolist() == spans.tolist()
+
+
+def test_domains_follow_the_extraction_window_when_present():
+    bins = pd.concat([C.bin_grid("chr1", 0, 512, 128),
+                      C.bin_grid("chr1", 4096, 4608, 128)], ignore_index=True)
+    bins["window_start"] = [0] * 4 + [4096] * 4
+    domains = C.concept_domains(bins)
+    assert [(d[0], d[1]) for d in domains] == [("chr1", 0), ("chr1", 4096)]
+    # Without the column the whole chromosome is one domain.
+    plain = C.concept_domains(bins.drop(columns="window_start"))
+    assert len(plain) == 1
+
+
+def test_the_null_still_moves_labels_when_bins_are_scattered():
+    # The failure this null was written to fix. Conv taps keep a sparse random
+    # subset of a window's bins, so neighbouring rows are far apart and a shift
+    # among rows does nothing. Shifting the concept has to work anyway.
+    rng = np.random.default_rng(0)
+    window, bin_bp = 1_048_576, 64
+    kept = np.sort(rng.choice(window // bin_bp, 8192, replace=False)) * bin_bp
+    bins = pd.DataFrame({"chrom": "chr1", "bin_start": kept,
+                         "bin_end": kept + bin_bp, "window_start": 0})
+    spans = np.sort(rng.choice(window - 400, 80, replace=False))
+    intervals = {"chr1": np.stack([spans, spans + 300], axis=1)}
+    labels = C.label_bins(bins, intervals)
+    draws = C.shifted_labels(bins, intervals, 20, seed=1)
+    unchanged = np.mean([float((d == labels).mean()) for d in draws])
+    assert unchanged < 0.999, "the shift barely moved the labels"
+    assert all(d.sum() > 0 for d in draws)
+
+
+def test_shifted_draws_are_reproducible():
     bins = grid(200)
-    labels = np.zeros(200, dtype=bool)
-    labels[50:70] = True  # one contiguous block
-    runs = C.contiguous_runs(bins, 128)
-    codes = C.RankedCodes(sparse.csc_matrix(np.abs(np.random.default_rng(0).normal(size=(200, 3)))))
-    null = C.circular_null(codes, labels, runs, n_permutations=25, seed=1)
+    bins["window_start"] = 0
+    intervals = {"chr19": np.array([[1280, 2560]], dtype=np.int64)}
+    a = C.shifted_labels(bins, intervals, 5, seed=3)
+    b = C.shifted_labels(bins, intervals, 5, seed=3)
+    for left, right in zip(a, b):
+        assert (left == right).all()
+
+
+def test_null_values_are_valid_aurocs():
+    bins = grid(200)
+    bins["window_start"] = 0
+    intervals = {"chr19": np.array([[6400, 8960]], dtype=np.int64)}
+    codes = C.RankedCodes(sparse.csc_matrix(
+        np.abs(np.random.default_rng(0).normal(size=(200, 3)))))
+    draws = C.shifted_labels(bins, intervals, 25, seed=1)
+    null = C.circular_null(codes, draws)
     assert null.shape == (25,)
     assert ((null >= 0) & (null <= 1)).all()
-
-    rng = np.random.default_rng(1)
-    shifted = labels.copy()
-    for run in runs:
-        shifted[run] = np.roll(labels[run], int(rng.integers(run.size)))
-    assert shifted.sum() == labels.sum()          # count preserved
-    assert np.diff(shifted.astype(int)).clip(0).sum() == 1  # still one block
 
 
 # --- encoding -------------------------------------------------------------
@@ -354,46 +399,49 @@ class TestPairedNulls:
         )
         return bins, acts, sae
 
+    def _draws(self, n, k, count=40, seed=0):
+        """`count` shifted label vectors over `n` bins with `k` positives."""
+        bins = grid(n)
+        bins["window_start"] = 0
+        width = k * 128
+        intervals = {"chr19": np.array([[0, width]], dtype=np.int64)}
+        return bins, C.shifted_labels(bins, intervals, count, seed=seed)
+
     def test_shifts_are_identical_for_the_same_seed(self):
-        labels = np.zeros(50, dtype=bool)
-        labels[:10] = True
-        runs = [np.arange(50)]
-        a = C.shifted_labels(labels, runs, 5, seed=3)
-        b = C.shifted_labels(labels, runs, 5, seed=3)
+        _, a = self._draws(200, 20, count=5, seed=3)
+        _, b = self._draws(200, 20, count=5, seed=3)
         for left, right in zip(a, b):
             assert (left == right).all()
-        # A circular shift moves labels without changing how many there are.
-        assert all(int(s.sum()) == 10 for s in a)
+        # The element keeps its length, so every draw has the same count.
+        assert len({int(s.sum()) for s in a}) == 1
 
     def test_more_candidates_give_a_higher_null_ceiling(self):
-        # The whole point. Under pure noise, the best of many columns beats the
-        # best of few, so an uncalibrated comparison favours the wider one.
+        # Under pure noise the best of many columns beats the best of few, so
+        # an uncalibrated comparison favours whichever side has more.
         rng = np.random.default_rng(1)
-        n = 400
-        labels = np.zeros(n, dtype=bool)
-        labels[rng.choice(n, 80, replace=False)] = True
-        runs = [np.arange(n)]
-        narrow = rng.normal(size=(n, 8)).astype(np.float32)
-        wide = rng.normal(size=(n, 512)).astype(np.float32)
-        ceiling_narrow = np.quantile(
-            C.circular_null_dense(narrow, labels, runs, 40, seed=0), 0.95)
-        ceiling_wide = np.quantile(
-            C.circular_null_dense(wide, labels, runs, 40, seed=0), 0.95)
+        _, draws = self._draws(400, 80, count=40, seed=0)
+        narrow = rng.normal(size=(400, 8)).astype(np.float32)
+        wide = rng.normal(size=(400, 512)).astype(np.float32)
+        ceiling_narrow = np.quantile(C.circular_null_dense(narrow, draws), 0.95)
+        ceiling_wide = np.quantile(C.circular_null_dense(wide, draws), 0.95)
         assert ceiling_wide > ceiling_narrow + 0.02
 
     def test_dense_null_matches_a_direct_computation(self):
         rng = np.random.default_rng(2)
-        n = 200
-        labels = np.zeros(n, dtype=bool)
-        labels[rng.choice(n, 60, replace=False)] = True
-        runs = [np.arange(n)]
-        acts = rng.normal(size=(n, 12)).astype(np.float32)
-        got = C.circular_null_dense(acts, labels, runs, 6, seed=5, block=5)
+        _, draws = self._draws(200, 60, count=6, seed=5)
+        acts = rng.normal(size=(200, 12)).astype(np.float32)
+        got = C.circular_null_dense(acts, draws, block=5)
         want = []
-        for shifted in C.shifted_labels(labels, runs, 6, seed=5):
+        for shifted in draws:
             folded, _ = C.directed(C.auroc_dense(acts, shifted))
             want.append(folded.max())
         assert got == pytest.approx(want)
+
+    def test_degenerate_draws_score_chance_instead_of_crashing(self):
+        # A concept too small to survive the shift must not kill the run.
+        empty = [np.zeros(50, dtype=bool), np.ones(50, dtype=bool)]
+        acts = np.random.default_rng(0).normal(size=(50, 4)).astype(np.float32)
+        assert C.circular_null_dense(acts, empty).tolist() == [0.5, 0.5]
 
     def test_matcher_reports_both_ceilings_and_the_calibrated_gap(self, tmp_path):
         bins, acts, sae = self._setup()

@@ -231,116 +231,179 @@ class RankedCodes:
 # --------------------------------------------------------------------------
 
 
-def contiguous_runs(bins: pd.DataFrame, bin_bp: int) -> list[np.ndarray]:
-    """Row-index blocks of bins that are adjacent on the same chromosome.
+def concept_domains(bins: pd.DataFrame) -> list[tuple[str, int, int, np.ndarray]]:
+    """Circular domains for the null: (chrom, start, end, row indices).
 
-    Splits are introduced wherever bins are missing (N-masked regions, split
-    boundaries). Shifting labels within a run rather than across the whole
-    genome keeps each concept's clustering intact.
+    One domain per extraction window when the coordinates carry `window_start`,
+    otherwise one per chromosome. The domain is the span a concept is allowed to
+    slide inside, so keeping it to a window holds local composition fixed.
     """
-    runs: list[np.ndarray] = []
-    for _, group in bins.groupby("chrom", sort=False):
-        order = group.sort_values("bin_start")
-        index = order.index.to_numpy()
-        starts = order.bin_start.to_numpy()
-        breaks = np.flatnonzero(np.diff(starts) != bin_bp) + 1
-        runs.extend(np.split(index, breaks))
-    return [run for run in runs if run.size]
+    has_window = "window_start" in bins.columns
+    keys = ["chrom", "window_start"] if has_window else ["chrom"]
+    domains = []
+    for key, group in bins.groupby(keys, sort=False):
+        chrom = str(key[0] if isinstance(key, tuple) else key)
+        start = int(group.window_start.iloc[0]) if has_window else int(group.bin_start.min())
+        end = int(group.bin_end.max())
+        if end > start:
+            domains.append((chrom, start, end, group.index.to_numpy()))
+    return domains
+
+
+def shift_intervals(spans: np.ndarray, start: int, end: int, offset: int) -> np.ndarray:
+    """Slide intervals by `offset` inside [start, end), wrapping at the edge.
+
+    Element count, element lengths and the gaps between elements all travel
+    together, so the concept keeps its spatial arrangement and only changes
+    where it sits. An element crossing the far edge comes back at the near one
+    as two pieces, which is what makes the shift circular rather than a
+    truncation.
+    """
+    length = end - start
+    if length <= 0:
+        raise ValueError("Domain must be a positive span")
+    spans = np.asarray(spans, dtype=np.int64)
+    if spans.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    width = np.minimum(spans[:, 1] - spans[:, 0], length)
+    lo = (spans[:, 0] - start + offset) % length
+    hi = lo + width
+    inside = np.stack([lo, np.minimum(hi, length)], axis=1)
+    over = hi > length
+    pieces = [inside]
+    if over.any():
+        pieces.append(np.stack([np.zeros(int(over.sum()), dtype=np.int64),
+                                hi[over] - length], axis=1))
+    out = np.concatenate(pieces) + start
+    return out[np.argsort(out[:, 0], kind="stable")]
+
+
+class ShiftedConcept:
+    """Draws of one concept's labels under a circular shift of its elements.
+
+    The earlier null moved labels between the rows that happened to be sampled.
+    That only works when neighbouring rows are adjacent on the genome. It is at
+    128 bp, where every bin of a window is kept, and it is not at the conv taps,
+    where 8192 of 262,144 bins are sampled: neighbours sit tens of bins apart,
+    runs collapse to one or two bins, and the shift leaves 99.9% of labels where
+    they were. Moving the concept instead is independent of which bins were
+    sampled and works the same at every tap.
+    """
+
+    def __init__(self, bins: pd.DataFrame, intervals: Mapping[str, np.ndarray]) -> None:
+        self.n_bins = len(bins)
+        self.parts = []
+        for chrom, start, end, rows in concept_domains(bins):
+            spans = np.asarray(intervals.get(chrom, np.empty((0, 2))), dtype=np.int64)
+            if spans.size:
+                keep = (spans[:, 1] > start) & (spans[:, 0] < end)
+                spans = spans[keep]
+            frame = bins.loc[rows, ["chrom", "bin_start", "bin_end"]]
+            self.parts.append((chrom, start, end, rows, spans, frame))
+
+    def draw(self, rng: np.random.Generator) -> np.ndarray:
+        labels = np.zeros(self.n_bins, dtype=bool)
+        for chrom, start, end, rows, spans, frame in self.parts:
+            if spans.size == 0:
+                continue
+            offset = int(rng.integers(end - start))
+            moved = shift_intervals(spans, start, end, offset)
+            labels[rows] = label_bins(frame.reset_index(drop=True), {chrom: moved})
+        return labels
 
 
 def shifted_labels(
-    labels: np.ndarray,
-    runs: Sequence[np.ndarray],
+    bins: pd.DataFrame,
+    intervals: Mapping[str, np.ndarray],
     n_permutations: int,
     seed: int,
 ) -> list[np.ndarray]:
-    """Circularly shifted copies of the labels, one per permutation.
+    """One shifted label vector per permutation.
 
-    Circular shift, not a plain shuffle, because adjacent 128 bp bins are
-    correlated and shuffling destroys that, making the null too optimistic.
-
-    Returned as a list rather than a generator so the SAE null and the raw null
-    can be scored against the identical shifts. That pairing removes the
-    permutation noise from the comparison between them.
+    Returned as a list so the SAE null and the raw null score the identical
+    draws. That pairing takes the permutation noise out of the comparison
+    between them.
     """
+    shifter = ShiftedConcept(bins, intervals)
     rng = np.random.default_rng(seed)
-    draws = []
-    for _ in range(n_permutations):
-        shifted = labels.copy()
-        for run in runs:
-            offset = int(rng.integers(run.size))
-            shifted[run] = np.roll(labels[run], offset)
-        draws.append(shifted)
-    return draws
+    return [shifter.draw(rng) for _ in range(n_permutations)]
 
 
 def circular_null(
     codes: RankedCodes,
-    labels: np.ndarray,
-    runs: Sequence[np.ndarray],
-    n_permutations: int,
-    seed: int,
+    draws: Sequence[np.ndarray],
     fired: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Best feature AUROC under shifted labels, the statistic that is reported.
+    """Best feature AUROC across the draws, the statistic that is reported.
 
     The null takes the max over features because the reported statistic is also
     a max over features. Against a single-feature null, a large dictionary would
     make almost anything look significant.
 
-    Two details keep the null and the observed statistic identical. The AUROC is
-    folded onto [0.5, 1] first, because the observed best is allowed to mark a
-    concept by going either way. And dead features are excluded, because the
-    observed best is picked only from features that fire.
+    Two details keep null and observed identical. AUROC is folded onto [0.5, 1]
+    first, because the observed best may mark a concept by going either way. And
+    dead features are excluded, because the observed best is picked only from
+    features that fire.
     """
-    best = np.empty(n_permutations, dtype=np.float64)
-    for draw, shifted in enumerate(
-            shifted_labels(labels, runs, n_permutations, seed)):
+    best = np.empty(len(draws), dtype=np.float64)
+    for index, shifted in enumerate(draws):
+        # A draw can land with no positives if the concept has few elements and
+        # the shift moves them off the sampled bins. AUROC is undefined there,
+        # so it scores chance. `degenerate_draws` counts these; a large count
+        # means the null is being built from too little, not that it is strict.
+        if not _usable(shifted):
+            best[index] = 0.5
+            continue
         folded, _ = directed(codes.auroc(shifted))
         if fired is not None:
             folded = np.where(fired, folded, 0.0)
-        best[draw] = folded.max()
+        best[index] = folded.max()
     return best
+
+
+def _usable(labels: np.ndarray) -> bool:
+    """True when a draw has both classes, so an AUROC exists."""
+    n_pos = int(labels.sum())
+    return 0 < n_pos < labels.size
 
 
 def circular_null_dense(
     activations: np.ndarray,
-    labels: np.ndarray,
-    runs: Sequence[np.ndarray],
-    n_permutations: int,
-    seed: int,
+    draws: Sequence[np.ndarray],
     block: int = 256,
 ) -> np.ndarray:
     """The same null for the raw channels, so the baseline is calibrated too.
 
-    Without this the two numbers are not comparable. The SAE reports the best
-    of 8192 features; the raw baseline the best of two directions on each of
-    d_in channels. Two things pull the ceilings apart: more candidates raise a
+    Without this the two numbers are not comparable. The SAE reports the best of
+    8192 features; the raw baseline the best of two directions on each of d_in
+    channels. Two things pull the ceilings apart: more candidates raise a
     maximum even with no signal, while TopK sparsity ties most bins at zero and
-    narrows the spread that the maximum is drawn from. They act in opposite
-    directions, so the sign of the gap cannot be reasoned out in advance and
-    has to be measured for each tap.
+    narrows the spread the maximum is drawn from. They act in opposite
+    directions, so the sign of the gap cannot be reasoned out in advance and has
+    to be measured for each tap.
 
     Ranking does not depend on the labels, so each column block is ranked once
-    and every permutation reuses it. Blocks keep the rank matrix off the heap:
-    ranking all d_in columns of a test split at once would need tens of GB.
+    and every draw reuses it. Blocks keep the rank matrix off the heap: ranking
+    all d_in columns of a test split at once would need tens of GB.
     """
     from scipy.stats import rankdata
 
-    draws = shifted_labels(labels, runs, n_permutations, seed)
-    n_pos = int(labels.sum())
-    n_neg = int(labels.size - n_pos)
-    if n_pos < 1 or n_neg < 1:
-        raise ValueError("AUROC needs both classes present")
-    best = np.full(n_permutations, -np.inf, dtype=np.float64)
+    if not draws:
+        raise ValueError("Need at least one permutation")
+    best = np.full(len(draws), -np.inf, dtype=np.float64)
     for start in range(0, activations.shape[1], block):
         chunk = np.asarray(activations[:, start:start + block], dtype=np.float32)
         ranks = rankdata(chunk, method="average", axis=0)
-        for draw, shifted in enumerate(draws):
+        for index, shifted in enumerate(draws):
+            if not _usable(shifted):
+                best[index] = max(best[index], 0.5)
+                continue
+            n_pos = int(shifted.sum())
+            n_neg = int(shifted.size - n_pos)
             r_pos = ranks[shifted].sum(axis=0, dtype=np.float64)
             auroc = (r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
             folded, _ = directed(auroc)
-            best[draw] = max(best[draw], float(folded.max()))
+            best[index] = max(best[index], float(folded.max()))
     return best
 
 
@@ -602,6 +665,8 @@ def match_concepts(
             f"bin_bp={bin_bp} but these bins are {int(widths[0])} bp wide")
 
     concepts = {name: label_bins(bins, spans) for name, spans in ccre.items()}
+    # The null shifts each concept's own intervals, so a concept with no
+    # intervals on these chromosomes cannot be calibrated and is dropped above.
     usable = {n: v for n, v in concepts.items()
               if MIN_POSITIVES <= int(v.sum()) <= len(bins) - MIN_POSITIVES}
     skipped = {n: int(v.sum()) for n, v in concepts.items() if n not in usable}
@@ -609,16 +674,17 @@ def match_concepts(
     codes = sae.encode(activations)
     ranked = RankedCodes(codes)
     fired = ranked.fired
-    runs = contiguous_runs(bins, bin_bp)
 
     records = []
     for name, labels in usable.items():
         sae_dir, sae_inv = directed(ranked.auroc(labels))
         # Only firing features can be picked; a dead one sits at 0.5.
         best = int(np.argmax(np.where(fired, sae_dir, 0.0)))
-        # The null is folded and fired-masked exactly like the observed value,
-        # so the two are the same statistic.
-        null = circular_null(ranked, labels, runs, n_permutations, seed, fired)
+        # One set of shifted draws, scored by both nulls, so the SAE ceiling
+        # and the raw ceiling are paired. The null is folded and fired-masked
+        # exactly like the observed value, so the two are the same statistic.
+        draws = shifted_labels(bins, ccre[name], n_permutations, seed)
+        null = circular_null(ranked, draws, fired)
         null_p95 = float(np.quantile(null, 0.95))
         row = {
             "concept": name,
@@ -629,13 +695,13 @@ def match_concepts(
             "best_inverse": bool(sae_inv[best]),
             "null_p95": null_p95,
             "sae_excess": float(sae_dir[best] - null_p95),
+            "degenerate_draws": int(sum(not _usable(d) for d in draws)),
             "recovered": bool(sae_dir[best] > null_p95),
         }
         if raw_baseline:
             raw_dir, _ = directed(auroc_dense(activations, labels))
             # Same shifts as the SAE null, so the two ceilings are paired.
-            raw_null = circular_null_dense(activations, labels, runs,
-                                           n_permutations, seed)
+            raw_null = circular_null_dense(activations, draws)
             raw_null_p95 = float(np.quantile(raw_null, 0.95))
             row["raw_best_channel"] = int(raw_dir.argmax())
             row["raw_best_auroc"] = float(raw_dir.max())
