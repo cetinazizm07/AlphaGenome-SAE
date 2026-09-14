@@ -492,7 +492,10 @@ AUROC = wins / (n_pos · n_neg)</code></pre>
     </tbody>
   </table></div>
 
-  <div class="note flag"><span class="lbl">Open confound in the current code</span>The null is computed only on the SAE codes. The raw-channel baseline is reported uncalibrated, so <code>sae_minus_raw</code> compares a maximum over 8192 features against a maximum over 2 × d_in channels — 8192 vs 3072 at the tower taps, 8192 vs 2048 at <code>bin_size_4</code>. More candidates give a higher maximum even under pure noise, so the difference is biased toward the SAE by an amount of the same order as the effects being reported. <strong>Fix before reporting</strong>: run the same permutations on the raw channels and compare calibrated excesses.</div>
+  <div class="note key"><span class="lbl">Both sides are now calibrated — fixed 2026-09-14</span>The null used to be computed only on the SAE codes, so <code>sae_minus_raw</code> compared a maximum over 8192 features against a maximum over 2 × d_in channels. The raw baseline now gets the <em>same</em> circular shifts, and the reported quantity is each side's excess over its own ceiling.
+  <p style="margin:10px 0 0">The direction of the old bias turned out <strong>not</strong> to be predictable, which is itself the argument for measuring rather than reasoning. Two forces pull the ceilings apart and they oppose each other: more candidates raise a maximum even under pure noise, while TopK sparsity ties most bins at zero and narrows the spread the maximum is drawn from. On a real checkpoint the SAE ceiling came out <em>lower</em> than the raw ceiling, the opposite of the naive expectation.</p></div>
+
+  <div class="note flag"><span class="lbl">A second mismatch found in the same place</span>The observed statistic folded AUROC onto [0.5, 1] and picked only from features that fire; the null did neither, taking a plain maximum over all features including dead ones. The null was therefore systematically too low and "recovered" too easy. Measured on a real checkpoint, correcting it moved the PLS ceiling from 0.661 to 0.698 and the dELS ceiling from 0.576 to 0.597. Null and observed now run through the identical statistic.</div>
 
   <div class="note"><span class="lbl">What three folds cannot do</span>A sign test with n = 3 has a one-sided floor of p = 0.125. No fold-level result can be "significant" no matter how clean it is. Fold agreement is qualitative replication and must be reported as such. Seeds are not biological replicates either — they measure optimisation noise, so take a median within fold and show the spread as a robustness band.</div>
 
@@ -605,9 +608,6 @@ AUROC = wins / (n_pos · n_neg)</code></pre>
   </table></div>
   <p>A 2.3× spread. The mitigating fact is that the best-of-dictionary null takes its maximum over the same effective dictionary, so <em>calibrated</em> AUROC comparisons remain fair. What does not survive is the sentence "we learned a dictionary of 8192 features": at <code>resid_pre_b4</code> roughly 3,340 were learned. AuxK is the standard remedy and is already planned as a separate labelled arm.</p>
 
-  <h3>Uncalibrated raw baseline</h3>
-  <p>Described in §11. This must be fixed before any SAE-versus-raw number is reported.</p>
-
   <h3>Permutation resolution</h3>
   <p>200 permutations cannot support FDR correction across roughly 200 comparisons. Raise the count or fit an extreme-value tail.</p>
 
@@ -635,6 +635,8 @@ AUROC = wins / (n_pos · n_neg)</code></pre>
       <tr><td><strong>conv/tower by position</strong></td><td>A figure classified taps by their index in the passed subset rather than their identity, so a tower-only call coloured everything convolutional.</td><td>Looking at the rendered figure.</td></tr>
       <tr><td><strong>Truncated bar axis</strong></td><td>Concept AUROC bars grew from the axis edge instead of from chance, exaggerating small differences.</td><td>Looking at the rendered figure.</td></tr>
       <tr><td><strong>Logo stack order</strong></td><td>Largest letter at the bottom inverts how a sequence logo is read.</td><td>Looking at the rendered figure.</td></tr>
+      <tr><td><strong>Uncalibrated baseline</strong></td><td>Only the SAE had a permutation ceiling, so the SAE-versus-raw margin compared maxima taken over different numbers of candidates.</td><td>Working out what the statistic actually measured, while writing §11.</td></tr>
+      <tr><td><strong>Null / observed mismatch</strong></td><td>The observed best was folded and restricted to firing features; the null was neither. The ceiling sat too low and concepts were called recovered too readily.</td><td>Reading the two code paths side by side.</td></tr>
       <tr><td><strong>Resume guard</strong></td><td>The runner skipped extraction whenever <code>index.json</code> merely existed, so a preempted partial run would have been accepted as complete.</td><td>Reading <code>run_extraction</code> instead of assuming.</td></tr>
     </tbody>
   </table></div>

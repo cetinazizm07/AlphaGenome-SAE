@@ -248,30 +248,99 @@ def contiguous_runs(bins: pd.DataFrame, bin_bp: int) -> list[np.ndarray]:
     return [run for run in runs if run.size]
 
 
+def shifted_labels(
+    labels: np.ndarray,
+    runs: Sequence[np.ndarray],
+    n_permutations: int,
+    seed: int,
+) -> list[np.ndarray]:
+    """Circularly shifted copies of the labels, one per permutation.
+
+    Circular shift, not a plain shuffle, because adjacent 128 bp bins are
+    correlated and shuffling destroys that, making the null too optimistic.
+
+    Returned as a list rather than a generator so the SAE null and the raw null
+    can be scored against the identical shifts. That pairing removes the
+    permutation noise from the comparison between them.
+    """
+    rng = np.random.default_rng(seed)
+    draws = []
+    for _ in range(n_permutations):
+        shifted = labels.copy()
+        for run in runs:
+            offset = int(rng.integers(run.size))
+            shifted[run] = np.roll(labels[run], offset)
+        draws.append(shifted)
+    return draws
+
+
 def circular_null(
     codes: RankedCodes,
     labels: np.ndarray,
     runs: Sequence[np.ndarray],
     n_permutations: int,
     seed: int,
+    fired: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Distribution of the best feature AUROC under circularly shifted labels.
-
-    Circular shift, not a plain shuffle, because adjacent 128 bp bins are
-    correlated and shuffling destroys that, making the null too optimistic.
+    """Best feature AUROC under shifted labels, the statistic that is reported.
 
     The null takes the max over features because the reported statistic is also
     a max over features. Against a single-feature null, a large dictionary would
     make almost anything look significant.
+
+    Two details keep the null and the observed statistic identical. The AUROC is
+    folded onto [0.5, 1] first, because the observed best is allowed to mark a
+    concept by going either way. And dead features are excluded, because the
+    observed best is picked only from features that fire.
     """
-    rng = np.random.default_rng(seed)
     best = np.empty(n_permutations, dtype=np.float64)
-    for draw in range(n_permutations):
-        shifted = labels.copy()
-        for run in runs:
-            offset = int(rng.integers(run.size))
-            shifted[run] = np.roll(labels[run], offset)
-        best[draw] = codes.auroc(shifted).max()
+    for draw, shifted in enumerate(
+            shifted_labels(labels, runs, n_permutations, seed)):
+        folded, _ = directed(codes.auroc(shifted))
+        if fired is not None:
+            folded = np.where(fired, folded, 0.0)
+        best[draw] = folded.max()
+    return best
+
+
+def circular_null_dense(
+    activations: np.ndarray,
+    labels: np.ndarray,
+    runs: Sequence[np.ndarray],
+    n_permutations: int,
+    seed: int,
+    block: int = 256,
+) -> np.ndarray:
+    """The same null for the raw channels, so the baseline is calibrated too.
+
+    Without this the two numbers are not comparable. The SAE reports the best
+    of 8192 features; the raw baseline the best of two directions on each of
+    d_in channels. Two things pull the ceilings apart: more candidates raise a
+    maximum even with no signal, while TopK sparsity ties most bins at zero and
+    narrows the spread that the maximum is drawn from. They act in opposite
+    directions, so the sign of the gap cannot be reasoned out in advance and
+    has to be measured for each tap.
+
+    Ranking does not depend on the labels, so each column block is ranked once
+    and every permutation reuses it. Blocks keep the rank matrix off the heap:
+    ranking all d_in columns of a test split at once would need tens of GB.
+    """
+    from scipy.stats import rankdata
+
+    draws = shifted_labels(labels, runs, n_permutations, seed)
+    n_pos = int(labels.sum())
+    n_neg = int(labels.size - n_pos)
+    if n_pos < 1 or n_neg < 1:
+        raise ValueError("AUROC needs both classes present")
+    best = np.full(n_permutations, -np.inf, dtype=np.float64)
+    for start in range(0, activations.shape[1], block):
+        chunk = np.asarray(activations[:, start:start + block], dtype=np.float32)
+        ranks = rankdata(chunk, method="average", axis=0)
+        for draw, shifted in enumerate(draws):
+            r_pos = ranks[shifted].sum(axis=0, dtype=np.float64)
+            auroc = (r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+            folded, _ = directed(auroc)
+            best[draw] = max(best[draw], float(folded.max()))
     return best
 
 
@@ -395,7 +464,7 @@ class FrozenSAE:
 # --------------------------------------------------------------------------
 
 
-def auroc_dense(x: np.ndarray, labels: np.ndarray) -> np.ndarray:
+def auroc_dense(x: np.ndarray, labels: np.ndarray, block: int = 256) -> np.ndarray:
     """AUROC of every column of a dense, possibly signed score matrix.
 
     Used for the raw-channel baseline. Raw AlphaGenome channels are signed, so
@@ -407,12 +476,19 @@ def auroc_dense(x: np.ndarray, labels: np.ndarray) -> np.ndarray:
     n_neg = int(labels.size - n_pos)
     if n_pos < 1 or n_neg < 1:
         raise ValueError("AUROC needs both classes present")
-    # rankdata keeps the input float dtype. Shards are stored float16, whose
-    # integers stop being exact above 2048 and which overflows to inf when the
-    # ranks are summed, so cast first and accumulate in float64.
-    ranks = rankdata(np.asarray(x, dtype=np.float32), method="average", axis=0)
-    r_pos = ranks[labels].sum(axis=0, dtype=np.float64)
-    return (r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+    out = np.empty(x.shape[1], dtype=np.float64)
+    # Ranked in column blocks. A test split is millions of rows, and ranking
+    # every channel at once would hold tens of GB of float ranks at peak.
+    for start in range(0, x.shape[1], block):
+        # rankdata keeps the input float dtype. Shards are stored float16,
+        # whose integers stop being exact above 2048 and which overflows to inf
+        # when the ranks are summed, so cast first and accumulate in float64.
+        chunk = np.asarray(x[:, start:start + block], dtype=np.float32)
+        ranks = rankdata(chunk, method="average", axis=0)
+        r_pos = ranks[labels].sum(axis=0, dtype=np.float64)
+        out[start:start + chunk.shape[1]] = (
+            (r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+    return out
 
 
 def directed(auroc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -540,8 +616,10 @@ def match_concepts(
         sae_dir, sae_inv = directed(ranked.auroc(labels))
         # Only firing features can be picked; a dead one sits at 0.5.
         best = int(np.argmax(np.where(fired, sae_dir, 0.0)))
-        null = circular_null(ranked, labels, runs, n_permutations, seed)
-        null_dir, _ = directed(null)
+        # The null is folded and fired-masked exactly like the observed value,
+        # so the two are the same statistic.
+        null = circular_null(ranked, labels, runs, n_permutations, seed, fired)
+        null_p95 = float(np.quantile(null, 0.95))
         row = {
             "concept": name,
             "n_positive_bins": int(labels.sum()),
@@ -549,18 +627,27 @@ def match_concepts(
             "best_feature": best,
             "best_auroc": float(sae_dir[best]),
             "best_inverse": bool(sae_inv[best]),
-            "null_p95": float(np.quantile(null_dir, 0.95)),
-            "recovered": bool(sae_dir[best] > np.quantile(null_dir, 0.95)),
+            "null_p95": null_p95,
+            "sae_excess": float(sae_dir[best] - null_p95),
+            "recovered": bool(sae_dir[best] > null_p95),
         }
         if raw_baseline:
             raw_dir, _ = directed(auroc_dense(activations, labels))
+            # Same shifts as the SAE null, so the two ceilings are paired.
+            raw_null = circular_null_dense(activations, labels, runs,
+                                           n_permutations, seed)
+            raw_null_p95 = float(np.quantile(raw_null, 0.95))
             row["raw_best_channel"] = int(raw_dir.argmax())
             row["raw_best_auroc"] = float(raw_dir.max())
-            # Read the margin, not the flag. An SAE feature that just
-            # reproduces a raw channel ties, and a 1e-9 gap is float noise.
-            # The flag only filters that noise out.
+            row["raw_null_p95"] = raw_null_p95
+            row["raw_excess"] = float(raw_dir.max() - raw_null_p95)
+            # Uncalibrated, kept only for reference. It compares a max over the
+            # dictionary with a max over twice the channel count, and more
+            # candidates give a higher max even with no signal.
             row["sae_minus_raw"] = float(row["best_auroc"] - row["raw_best_auroc"])
-            row["sae_beats_raw"] = bool(row["sae_minus_raw"] > 1e-6)
+            # The number to report: each side measured against its own ceiling.
+            row["calibrated_advantage"] = float(row["sae_excess"] - row["raw_excess"])
+            row["sae_beats_raw"] = bool(row["calibrated_advantage"] > 1e-6)
         records.append(row)
 
     top = top_bins_report(codes, bins, usable, top_n)
@@ -657,7 +744,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (out / "summary.json").write_text(json.dumps(result.summary, indent=2))
 
     columns = [c for c in ("concept", "n_positive_bins", "best_feature", "best_auroc",
-                           "null_p95", "raw_best_auroc", "sae_minus_raw", "recovered")
+                           "null_p95", "sae_excess", "raw_best_auroc",
+                           "raw_null_p95", "raw_excess", "calibrated_advantage",
+                           "recovered")
                if c in result.per_concept.columns]
     print(result.per_concept[columns].to_string(index=False))
     print(f"\neffective dictionary: {result.summary['n_features_fired']}/{result.summary['n_features']}"

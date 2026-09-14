@@ -339,3 +339,89 @@ def test_ranked_codes_handles_leading_and_trailing_dead_features():
     assert got.tolist()[3:] == [0.5, 0.5]
     assert got[2] == pytest.approx(1.0)
     assert ranked.fired.tolist() == [False, False, True, False, False]
+
+
+class TestPairedNulls:
+    def _setup(self, n_bins=600, d_in=40, n_features=400, seed=0):
+        rng = np.random.default_rng(seed)
+        bins = C.bin_grid("chr1", 0, 128 * n_bins, 128)
+        acts = rng.normal(size=(n_bins, d_in)).astype(np.float32)
+        sae = C.FrozenSAE(
+            W_enc=rng.normal(size=(d_in, n_features)).astype(np.float32) * 0.3,
+            b_enc=np.zeros(n_features, dtype=np.float32),
+            b_pre=np.zeros(d_in, dtype=np.float32),
+            k=20,
+        )
+        return bins, acts, sae
+
+    def test_shifts_are_identical_for_the_same_seed(self):
+        labels = np.zeros(50, dtype=bool)
+        labels[:10] = True
+        runs = [np.arange(50)]
+        a = C.shifted_labels(labels, runs, 5, seed=3)
+        b = C.shifted_labels(labels, runs, 5, seed=3)
+        for left, right in zip(a, b):
+            assert (left == right).all()
+        # A circular shift moves labels without changing how many there are.
+        assert all(int(s.sum()) == 10 for s in a)
+
+    def test_more_candidates_give_a_higher_null_ceiling(self):
+        # The whole point. Under pure noise, the best of many columns beats the
+        # best of few, so an uncalibrated comparison favours the wider one.
+        rng = np.random.default_rng(1)
+        n = 400
+        labels = np.zeros(n, dtype=bool)
+        labels[rng.choice(n, 80, replace=False)] = True
+        runs = [np.arange(n)]
+        narrow = rng.normal(size=(n, 8)).astype(np.float32)
+        wide = rng.normal(size=(n, 512)).astype(np.float32)
+        ceiling_narrow = np.quantile(
+            C.circular_null_dense(narrow, labels, runs, 40, seed=0), 0.95)
+        ceiling_wide = np.quantile(
+            C.circular_null_dense(wide, labels, runs, 40, seed=0), 0.95)
+        assert ceiling_wide > ceiling_narrow + 0.02
+
+    def test_dense_null_matches_a_direct_computation(self):
+        rng = np.random.default_rng(2)
+        n = 200
+        labels = np.zeros(n, dtype=bool)
+        labels[rng.choice(n, 60, replace=False)] = True
+        runs = [np.arange(n)]
+        acts = rng.normal(size=(n, 12)).astype(np.float32)
+        got = C.circular_null_dense(acts, labels, runs, 6, seed=5, block=5)
+        want = []
+        for shifted in C.shifted_labels(labels, runs, 6, seed=5):
+            folded, _ = C.directed(C.auroc_dense(acts, shifted))
+            want.append(folded.max())
+        assert got == pytest.approx(want)
+
+    def test_matcher_reports_both_ceilings_and_the_calibrated_gap(self, tmp_path):
+        bins, acts, sae = self._setup()
+        rng = np.random.default_rng(7)
+        spans = np.sort(rng.choice(len(bins) - 2, 40, replace=False)) * 128
+        ccre = {"PLS": {"chr1": np.stack([spans, spans + 256], axis=1)}}
+        result = C.match_concepts(sae, acts, bins, ccre, bin_bp=128,
+                                  n_permutations=12, seed=0)
+        row = result.per_concept.iloc[0]
+        for column in ("null_p95", "sae_excess", "raw_null_p95", "raw_excess",
+                       "calibrated_advantage", "sae_minus_raw"):
+            assert column in result.per_concept.columns
+        assert row.sae_excess == pytest.approx(row.best_auroc - row.null_p95)
+        assert row.raw_excess == pytest.approx(row.raw_best_auroc - row.raw_null_p95)
+        assert row.calibrated_advantage == pytest.approx(
+            row.sae_excess - row.raw_excess)
+        # The two ceilings differ, which is the reason calibration is needed.
+        # The direction is not predictable: a wider dictionary pushes the
+        # ceiling up, but TopK sparsity ties most bins at zero and pushes it
+        # back down. Which wins is an empirical question per tap.
+        assert abs(row.null_p95 - row.raw_null_p95) > 1e-6
+
+    def test_dense_block_size_does_not_change_the_answer(self):
+        rng = np.random.default_rng(3)
+        n = 150
+        labels = np.zeros(n, dtype=bool)
+        labels[rng.choice(n, 40, replace=False)] = True
+        acts = rng.normal(size=(n, 37)).astype(np.float32)
+        whole = C.auroc_dense(acts, labels, block=1000)
+        split = C.auroc_dense(acts, labels, block=7)
+        assert whole == pytest.approx(split)
