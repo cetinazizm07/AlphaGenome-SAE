@@ -37,49 +37,66 @@ def auroc_from_dense_ranks(R, Y, chunk=16):
     return out
 
 def build_sparse_rank_struct(Fcsc):
-    """Fcsc: scipy CSC (N,nf), nonneg (TopK+relu). Returns (Rsp, Bpat, base, N):
-       Rsp  = CSC of average ranks at the true-nonzero entries,
-       Bpat = CSC binary pattern of true nonzeros,
-       base = (nf,) average rank of each feature's zero block."""
-    # The caller owns this matrix for the rest of the analysis; canonicalize
-    # it in place instead of keeping a second multi-gigabyte full-test copy.
+    """Turn nonnegative CSC activations into exact rank deltas in place.
+
+    Every implicit zero in a feature has the same average rank ``base``.  A
+    nonzero entry therefore only needs to store ``rank - base``; its concept
+    rank sum is ``base * n_positive + delta.T @ labels``.  Keeping one delta
+    matrix instead of separate activation, rank, and binary-pattern matrices
+    is essential for full-fold TopK caches with hundreds of millions of
+    entries.
+
+    Ranks and deltas are integer or half-integer and N is below 2**24 in this
+    pipeline, so float32 stores them exactly.  Multiplication by float64 labels
+    below accumulates the rank sums in float64.
+    """
     Fcsc = Fcsc.tocsc(copy=False)
     Fcsc.sum_duplicates()
     Fcsc.eliminate_zeros()
     if not np.isfinite(Fcsc.data).all() or (Fcsc.data < 0).any():
         raise ValueError("Sparse AUROC requires finite, nonnegative activations")
     N, nf = Fcsc.shape
-    Rdat = np.zeros_like(Fcsc.data, dtype=np.float64)
     base = np.zeros(nf)
+    firing_rate = np.diff(Fcsc.indptr).astype(np.float64) / float(N)
     for f in range(nf):
         s, e = Fcsc.indptr[f], Fcsc.indptr[f + 1]
         vals = Fcsc.data[s:e]
-        pos = vals > 0                       # relu may store exact zeros
-        m = int(pos.sum())
+        m = len(vals)
         base[f] = (N - m + 1) / 2.0
         if m:
-            rr = np.full(vals.shape, base[f], dtype=np.float64)
-            rr[pos] = rankdata(vals[pos]) + (N - m)
-            Rdat[s:e] = rr
-        else:
-            Rdat[s:e] = base[f]
-    Rsp = sparse.csc_matrix((Rdat, Fcsc.indices, Fcsc.indptr),
-                            shape=(N, nf), copy=False)
-    Bpat = Fcsc.copy()
-    Bpat.data = (Fcsc.data > 0).astype(np.float32)
-    return Rsp, Bpat, base, N
+            ranks = rankdata(vals) + (N - m)
+            vals[:] = ranks - base[f]
+    return Fcsc, base, N, firing_rate
 
-def auroc_from_sparse_ranks(Rsp, Bpat, base, N, Y):
-    """Exact AUROC (nf,nc) reusing precomputed sparse ranks."""
+def auroc_from_sparse_ranks(Rdelta, base, N, Y):
+    """Exact AUROC (nf,nc) from sparse rank deltas and zero-block ranks."""
     Yf = Y.astype(np.float64)
     n1 = Yf.sum(0); n0 = N - n1
     valid = (n1 > 0) & (n0 > 0)
-    r1_nz = Rsp.T @ Yf                        # rank-sum over nonzero rows
-    k1 = Bpat.T @ Yf                          # # concept-pos rows that are nonzero
-    r1 = r1_nz + base[:, None] * (n1[None, :] - k1)   # zero-block contribution
+    r1 = base[:, None] * n1[None, :] + Rdelta.T @ Yf
     auc = (r1 - n1 * (n1 + 1) / 2) / (n1 * n0)
     auc[:, ~valid] = np.nan
     return auc
+
+def selected_sae_scores(model, data, features, batch_size, device):
+    """Re-encode only the selected SAE features after ranks replace values."""
+    import torch
+
+    features = np.asarray(features, dtype=np.int64)
+    unique, inverse = np.unique(features, return_inverse=True)
+    selected = np.zeros((len(data), len(unique)), dtype=np.float32)
+    offset = 0
+    with torch.no_grad():
+        for batch in data.batches(batch_size):
+            xb = torch.from_numpy(batch).to(device)
+            topv, topi = model.encode_topk(xb)
+            end = offset + len(batch)
+            for column, feature in enumerate(unique):
+                selected[offset:end, column] = (
+                    topv * (topi == int(feature))
+                ).sum(dim=1).cpu().numpy()
+            offset = end
+    return selected[:, inverse]
 
 ORIGINAL_8 = ["cCRE_PLS", "cCRE_pELS", "cCRE_dELS", "cCRE_CTCF", "TF_binding",
               "TSS_promoter", "splice_donor", "splice_acceptor"]
@@ -293,8 +310,8 @@ def cmd_match(argv):
         f"({'sparse' if sparse_mode else 'dense'} rank-once)...")
 
     if sparse_mode:
-        Rsp, Bpat, base, N = build_sparse_rank_struct(Fcsc)
-        score = lambda Ym: auroc_from_sparse_ranks(Rsp, Bpat, base, N, Ym)
+        Rdelta, base, N, firing_rate = build_sparse_rank_struct(Fcsc)
+        score = lambda Ym: auroc_from_sparse_ranks(Rdelta, base, N, Ym)
     else:
         R = rank_once_dense(X, feat_chunk=args.dense_rank_chunk)
         score = lambda Ym: auroc_from_dense_ranks(
@@ -304,12 +321,7 @@ def cmd_match(argv):
     # fold AUROC<0.5 (anti-correlated features are still informative): use max(a,1-a)
     A_dir = np.maximum(A, 1 - A)
 
-    if sparse_mode:
-        _Fnz = Fcsc.copy()
-        _Fnz.eliminate_zeros()            # topk+relu acik sifir saklayabilir; onlari at
-        firing_rate = (np.diff(_Fnz.indptr) / float(Fcsc.shape[0])).astype(np.float64)
-        del _Fnz
-    else:
+    if not sparse_mode:
         # Ham noron temel cizgisi: aktivasyonlar neredeyse hic tam sifir degildir,
         # dolayisiyla q ~ 1.0 ve tavan ~ 1.0 cikar. Bu KASITLI: normalizasyon
         # seyrek koda hakkini verir, yogun temel cizgiye avantaj vermez.
@@ -318,6 +330,13 @@ def cmd_match(argv):
     # best feature per concept
     best_feat = np.nanargmax(A_dir, axis=0)
     best_auroc = np.nanmax(A_dir, axis=0)
+    if sparse_mode:
+        selected_feature_scores = selected_sae_scores(
+            model, data, best_feat, args.batch_size, args.device)
+        del model
+        import torch
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     # Default null: independently rotate labels within contiguous genomic runs.
     # Each rotation preserves prevalence and cross-concept co-occurrence, and
@@ -386,7 +405,7 @@ def cmd_match(argv):
             int(event_config["block_bp"]))
     for c in range(_nc):
         if sparse_mode:
-            selected_scores = np.asarray(Fcsc.getcol(best_feat[c]).toarray()).ravel()
+            selected_scores = selected_feature_scores[:, c]
         else:
             selected_scores = X[:, best_feat[c]]
         oriented = selected_scores * match_sign[c]
