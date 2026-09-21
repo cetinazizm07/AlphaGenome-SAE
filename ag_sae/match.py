@@ -40,7 +40,9 @@ def build_sparse_rank_struct(Fcsc):
        Rsp  = CSC of average ranks at the true-nonzero entries,
        Bpat = CSC binary pattern of true nonzeros,
        base = (nf,) average rank of each feature's zero block."""
-    Fcsc = Fcsc.tocsc(copy=True)
+    # The caller owns this matrix for the rest of the analysis; canonicalize
+    # it in place instead of keeping a second multi-gigabyte full-test copy.
+    Fcsc = Fcsc.tocsc(copy=False)
     Fcsc.sum_duplicates()
     Fcsc.eliminate_zeros()
     if not np.isfinite(Fcsc.data).all() or (Fcsc.data < 0).any():
@@ -60,8 +62,10 @@ def build_sparse_rank_struct(Fcsc):
             Rdat[s:e] = rr
         else:
             Rdat[s:e] = base[f]
-    Rsp = sparse.csc_matrix((Rdat, Fcsc.indices, Fcsc.indptr), shape=(N, nf))
-    Bpat = Fcsc.copy(); Bpat.data = (Fcsc.data > 0).astype(np.float64)
+    Rsp = sparse.csc_matrix((Rdat, Fcsc.indices, Fcsc.indptr),
+                            shape=(N, nf), copy=False)
+    Bpat = Fcsc.copy()
+    Bpat.data = (Fcsc.data > 0).astype(np.float32)
     return Rsp, Bpat, base, N
 
 def auroc_from_sparse_ranks(Rsp, Bpat, base, N, Y):
@@ -250,24 +254,28 @@ def cmd_match(argv):
                 "Use a smaller k, blockwise matching, or explicitly pass "
                 "--allow-large-sae after checking available RAM.")
         log(f"SAE sparse-entry upper bound: {estimated_nnz:,}")
-        # collect COO triplets of TopK activations across row-batches
-        rows_l, cols_l, vals_l = [], [], []
+        # A row has exactly k selected entries, so build CSR directly.  COO
+        # row indices would consume another 8 bytes per entry and the lists +
+        # concatenation temporarily doubled memory on full 1-Mb test folds.
+        # int32 is valid because SciPy sparse dimensions and the guarded nnz
+        # count are both below its range for this experiment.
+        cols = np.empty(estimated_nnz, dtype=np.int32)
+        vals = np.empty(estimated_nnz, dtype=np.float32)
         offset = 0
         with torch.no_grad():
             for batch in data.batches(args.batch_size):
                 xb = torch.from_numpy(batch).to(args.device)
                 topv, topi = model.encode_topk(xb)
                 nb = xb.shape[0]
-                rr = (torch.arange(nb, device=xb.device).unsqueeze(1)
-                      .expand(nb, k) + offset)
-                rows_l.append(rr.reshape(-1).cpu().numpy())
-                cols_l.append(topi.reshape(-1).cpu().numpy())
-                vals_l.append(topv.reshape(-1).cpu().numpy().astype(np.float32))
+                lo, hi = offset * k, (offset + nb) * k
+                cols[lo:hi] = topi.reshape(-1).cpu().numpy().astype(np.int32, copy=False)
+                vals[lo:hi] = topv.reshape(-1).cpu().numpy().astype(np.float32, copy=False)
                 offset += nb
-        rows = np.concatenate(rows_l); cols = np.concatenate(cols_l)
-        vals = np.concatenate(vals_l)
-        Fcsc = sparse.csc_matrix((vals, (rows, cols)),
+        indptr = np.arange(0, estimated_nnz + 1, k, dtype=np.int64)
+        Fcsr = sparse.csr_matrix((vals, cols, indptr),
                                  shape=(len(data), nfeat), dtype=np.float32)
+        Fcsc = Fcsr.tocsc()
+        del Fcsr, vals, cols, indptr
         Fcsc.sum_duplicates()
         feat_names = [f"sae_{i}" for i in range(nfeat)]
         tag = f"sae_{os.path.basename(args.sae)}"
