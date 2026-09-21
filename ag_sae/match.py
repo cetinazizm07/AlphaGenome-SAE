@@ -12,7 +12,7 @@ from .data import log, read_annotation, ActivationStore
 from .statistics import (average_precision, domain_precision_recall_f1,
                          event_enrichment_with_block_bootstrap,
                          genomic_block_ids)
-def rank_once_dense(F, feat_chunk=1024):
+def rank_once_dense(F, feat_chunk=32):
     """F:(N,nf) real -> R:(N,nf) float32 average ranks per column (exact:
     N<1.6e7 so integer/half ranks are exact in float32)."""
     N, nf = F.shape
@@ -22,7 +22,7 @@ def rank_once_dense(F, feat_chunk=1024):
         R[:, s:e] = rankdata(F[:, s:e], axis=0).astype(np.float32)
     return R
 
-def auroc_from_dense_ranks(R, Y, chunk=512):
+def auroc_from_dense_ranks(R, Y, chunk=16):
     """R:(N,nf) float32 ranks, Y:(N,nc) bool -> (nf,nc) AUROC."""
     N, nf = R.shape
     Yf = Y.astype(np.float64); n1 = Yf.sum(0); n0 = N - n1
@@ -195,6 +195,10 @@ def cmd_match(argv):
     ap.add_argument("--batch-size", type=int, default=1024, help="SAE encoding batch size")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers for independent permutation scores")
+    ap.add_argument("--dense-rank-chunk", type=int, default=32,
+                    help="raw-mode feature columns ranked at once (lower uses less RAM)")
+    ap.add_argument("--dense-score-chunk", type=int, default=16,
+                    help="raw-mode feature columns scored at once per worker")
     ap.add_argument("--max-sae-nnz", type=int, default=250_000_000,
                     help="upper bound for materialized sparse entries (use 0 to disable)")
     ap.add_argument("--allow-large-sae", action="store_true",
@@ -218,8 +222,9 @@ def cmd_match(argv):
 
     # load activations for split, apply same mask
     data = ActivationStore(args.act_dir, args.split, ann)
-    if args.batch_size < 1 or args.workers < 1:
-        raise ValueError("batch-size and workers must be positive")
+    if (args.batch_size < 1 or args.workers < 1
+            or args.dense_rank_chunk < 1 or args.dense_score_chunk < 1):
+        raise ValueError("batch-size, workers, and dense chunks must be positive")
     if len(data) != len(Y):
         raise ValueError("Activation/label row mismatch")
     log(f"{args.split}: {len(data)} kept bins, {data.dim} raw dims")
@@ -291,8 +296,9 @@ def cmd_match(argv):
         Rsp, Bpat, base, N = build_sparse_rank_struct(Fcsc)
         score = lambda Ym: auroc_from_sparse_ranks(Rsp, Bpat, base, N, Ym)
     else:
-        R = rank_once_dense(X)
-        score = lambda Ym: auroc_from_dense_ranks(R, Ym)
+        R = rank_once_dense(X, feat_chunk=args.dense_rank_chunk)
+        score = lambda Ym: auroc_from_dense_ranks(
+            R, Ym, chunk=args.dense_score_chunk)
 
     A = score(Y)                              # (feat, concept) — HAM (katlanmamis) AUROC
     # fold AUROC<0.5 (anti-correlated features are still informative): use max(a,1-a)
