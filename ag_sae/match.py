@@ -1,5 +1,6 @@
 """Feature matching with exact sparse ranks and genomic permutation nulls."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import numpy as np
@@ -192,6 +193,8 @@ def cmd_match(argv):
                     help="concept_panel_v2.json; verilmezse v1 ORIGINAL_8 paneli kullanilir")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch-size", type=int, default=1024, help="SAE encoding batch size")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel workers for independent permutation scores")
     ap.add_argument("--max-sae-nnz", type=int, default=250_000_000,
                     help="upper bound for materialized sparse entries (use 0 to disable)")
     ap.add_argument("--allow-large-sae", action="store_true",
@@ -215,8 +218,8 @@ def cmd_match(argv):
 
     # load activations for split, apply same mask
     data = ActivationStore(args.act_dir, args.split, ann)
-    if args.batch_size < 1:
-        raise ValueError("batch-size must be positive")
+    if args.batch_size < 1 or args.workers < 1:
+        raise ValueError("batch-size and workers must be positive")
     if len(data) != len(Y):
         raise ValueError("Activation/label row mismatch")
     log(f"{args.split}: {len(data)} kept bins, {data.dim} raw dims")
@@ -316,13 +319,25 @@ def cmd_match(argv):
     # recalculated for every draw to include feature-selection multiplicity.
     rng = np.random.default_rng(args.null_seed)
     null_best = np.zeros((args.n_control, len(CONCEPTS)))
-    for t in range(args.n_control):
-        perm = permuted_indices(Y.shape[0], rng, args.null_mode, runs)
+
+    def score_permutation(perm):
         Ap = score(Y[perm])                   # (feat, concept) under permuted labels
         Ap = np.maximum(Ap, 1 - Ap)
-        null_best[t] = np.nanmax(Ap, axis=0)
-        if (t + 1) % 25 == 0:
-            log(f"  control perm {t+1}/{args.n_control}")
+        return np.nanmax(Ap, axis=0)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        completed = 0
+        while completed < args.n_control:
+            count = min(args.workers, args.n_control - completed)
+            # Draw permutations on the main thread in the same order as the
+            # serial implementation. Only deterministic scoring is parallel.
+            perms = [permuted_indices(Y.shape[0], rng, args.null_mode, runs)
+                     for _ in range(count)]
+            for result in executor.map(score_permutation, perms):
+                null_best[completed] = result
+                completed += 1
+                if completed % 25 == 0 or completed == args.n_control:
+                    log(f"  control perm {completed}/{args.n_control}")
     ctrl_95 = np.nanpercentile(null_best, 95, axis=0)
 
     recovered = (best_auroc >= 0.70) & (best_auroc > ctrl_95)
