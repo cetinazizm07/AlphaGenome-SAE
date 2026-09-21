@@ -232,10 +232,10 @@ def cmd_match(argv):
         sparse_mode = False
     else:
         import torch
-        from .sae import TopKSAE
+        from .sae import BorzoiSAE
         if not args.sae:
             raise ValueError("--sae checkpoint is required in SAE mode")
-        model = TopKSAE.from_checkpoint(args.sae, args.device)
+        model = BorzoiSAE.from_checkpoint(args.sae, args.device)
         if model.d_in != data.dim:
             raise ValueError("SAE/activation dimension mismatch")
         nfeat, k = model.n_feat, model.k

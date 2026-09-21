@@ -116,6 +116,11 @@ class BorzoiSAE(nn.Module):
         self.core.temperature.requires_grad_(False)
         self.d_in, self.hidden, self.k = d_in, hidden, k
 
+    @property
+    def n_feat(self) -> int:
+        """Dictionary width used by the sparse matching interface."""
+        return self.hidden
+
     def forward(self, raw: torch.Tensor):
         """Return (reconstruction, sparse codes, scaled input).
 
@@ -125,6 +130,15 @@ class BorzoiSAE(nn.Module):
         pre, params = self.core.encode(scaled)
         codes = self.core.get_sparse_activations(self.core.activation(pre))
         return self.core.decode(codes, params), codes, scaled
+
+    @torch.no_grad()
+    def encode_topk(self, raw: torch.Tensor):
+        """Return positive TopK values and indices without densifying codes."""
+        if raw.ndim != 2 or raw.shape[1] != self.d_in:
+            raise ValueError(f"Expected (n, {self.d_in}) input, got {tuple(raw.shape)}")
+        scaled = raw / self.channel_scale
+        pre, _ = self.core.encode(scaled)
+        return torch.topk(self.core.activation(pre), k=self.k, dim=-1)
 
     @torch.no_grad()
     def reconstruct(self, raw: torch.Tensor):
@@ -139,6 +153,33 @@ class BorzoiSAE(nn.Module):
                 "latent_bias": self.core.latent_bias.detach().cpu().clone(),
                 "pre_bias": self.core.pre_bias.detach().cpu().clone(),
                 "channel_scale": self.channel_scale.detach().cpu().clone()}
+
+    @classmethod
+    def from_checkpoint(cls, path: str | Path, device: str = "cpu") -> "BorzoiSAE":
+        """Load the inference checkpoint written by ``save_inference_checkpoint``."""
+        blob = torch.load(Path(path), map_location="cpu", weights_only=True)
+        state = blob.get("state", {})
+        recipe = blob.get("recipe", {})
+        required = {"encoder.weight", "decoder.weight", "latent_bias", "pre_bias",
+                    "channel_scale"}
+        missing = sorted(required - set(state))
+        if missing:
+            raise ValueError(f"Inference checkpoint is missing tensors: {missing}")
+        if not all(torch.is_tensor(state[name]) and torch.isfinite(state[name]).all()
+                   for name in required):
+            raise ValueError("Inference checkpoint contains invalid tensors")
+        encoder = state["encoder.weight"]
+        hidden, d_in = encoder.shape
+        k = int(recipe.get("k", 0))
+        if recipe.get("d_in", d_in) != d_in or recipe.get("hidden", hidden) != hidden:
+            raise ValueError("Checkpoint recipe disagrees with tensor dimensions")
+        model = cls(d_in, hidden, k, state["channel_scale"])
+        with torch.no_grad():
+            model.core.encoder.weight.copy_(encoder)
+            model.core.decoder.weight.copy_(state["decoder.weight"])
+            model.core.latent_bias.copy_(state["latent_bias"])
+            model.core.pre_bias.copy_(state["pre_bias"])
+        return model.to(device).eval().requires_grad_(False)
 
 
 def save_inference_checkpoint(path: str | Path, model: BorzoiSAE, recipe: Recipe,

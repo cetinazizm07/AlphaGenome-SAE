@@ -117,6 +117,18 @@ class TestCheckpointContract:
         got = frozen.encode(activations, chunk=16).toarray()
         np.testing.assert_allclose(got, expected.detach().numpy(), rtol=0, atol=1e-5)
 
+    def test_saved_model_reloads_for_sparse_match(self, tmp_path):
+        recipe = S.Recipe(n_features=16, topk_pct=0.25, seed=3)
+        model = S.build(4, recipe, np.ones(4, dtype=np.float32))
+        path = S.save_inference_checkpoint(tmp_path / "sae.pt", model, recipe)
+        loaded = S.BorzoiSAE.from_checkpoint(path)
+
+        raw = torch.randn(3, 4)
+        expected = model(raw)[1]
+        values, indices = loaded.encode_topk(raw)
+        actual = torch.zeros_like(expected).scatter_(-1, indices, values)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_refuses_to_save_broken_parameters(self, tmp_path):
         model = S.build(8, S.Recipe(n_features=32), np.ones(8))
         with torch.no_grad():
