@@ -253,3 +253,52 @@ class TestFeatureRemover:
                                     np.ones((4, 3)), [0], positions=np.array([1]))
         with pytest.raises(ValueError, match="one entry per code row"):
             replace(np.ones((5, 3), dtype=np.float32))
+
+
+def test_model_aware_ablation_inverts_layernorm_and_channel_scale():
+    import torch
+
+    class Core:
+        def __init__(self):
+            self.decoder = torch.nn.Linear(2, 3, bias=False)
+            with torch.no_grad():
+                self.decoder.weight.copy_(torch.tensor([[0.2, -0.1],
+                                                        [-0.4, 0.3],
+                                                        [0.1, 0.5]]))
+
+        def encode(self, scaled):
+            params = {
+                "mu": scaled.mean(dim=-1, keepdim=True),
+                "std": scaled.std(dim=-1, keepdim=True),
+            }
+            codes = torch.tensor([[2.0, 1.0]] * len(scaled), dtype=scaled.dtype)
+            return codes, params
+
+        @staticmethod
+        def activation(values):
+            return values
+
+        @staticmethod
+        def get_sparse_activations(values):
+            return values
+
+        def decode(self, codes, params):
+            normalized = self.decoder(codes)
+            return normalized * (params["std"] + 1e-5) + params["mu"]
+
+    class SAE:
+        d_in = 3
+        hidden = 2
+
+        def __init__(self):
+            self.channel_scale = torch.tensor([2.0, 4.0, 8.0])
+            self.core = Core()
+
+    sae = SAE()
+    raw = torch.tensor([[10.0, -2.0, 4.0], [3.0, 6.0, -1.0]])
+    edited = A.ablate_sae_features(sae, raw, [0], positions=[1])
+    std = (raw[1] / sae.channel_scale).std()
+    decoder_column = sae.core.decoder.weight[:, 0]
+    expected = raw[1] - 2.0 * decoder_column * (std + 1e-5) * sae.channel_scale
+    torch.testing.assert_close(edited[1], expected)
+    torch.testing.assert_close(edited[0], raw[0])

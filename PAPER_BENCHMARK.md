@@ -1,7 +1,7 @@
 # External 55-concept benchmark
 
 The ICML 2026 benchmark from Nair et al. is intentionally kept separate from
-the frozen project panel in `concept_panel_v3.json`. It is an external
+the frozen project panel in `concept_panel.json`. It is an external
 replication/coverage test; it does not add confirmatory hypotheses and it does
 not change the AlphaGenome intervention readout map.
 

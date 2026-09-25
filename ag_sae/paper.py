@@ -280,7 +280,7 @@ def build_paper_matrix(ann_path, source_path, out_ann, out_panel, out_prevalence
         "source_manifest": str(manifest_path),
         "provenance": provenance,
         "separation_note": (
-            "This benchmark does not alter concept_panel_v3.json, its FDR family, "
+            "This benchmark does not alter concept_panel.json, its FDR family, "
             "or the pre-registered AlphaGenome intervention readout map."
         ),
     }

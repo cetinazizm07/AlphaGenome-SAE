@@ -3,15 +3,12 @@ import importlib
 import sys
 
 STAGES = {
-    "folds": ("prepare.folds", "cmd_folds"),
     "matrix": ("prepare.annotations", "cmd_matrix"),
-    "fetch": ("prepare.sources", "cmd_fetch"),
     "panel": ("prepare.annotations", "cmd_panel"),
     "paper": ("paper", "cmd_paper"),
-    "extract": ("backbone", "cmd_extract"),
-    "sae": ("train", "cmd_sae"),
+    "extract": ("extract", "main"),
+    "sae": ("train", "main"),
     "match": ("match", "cmd_match"),
-    "intervene": ("intervene", "cmd_intervene"),
 }
 
 

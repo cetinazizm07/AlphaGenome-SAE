@@ -3,12 +3,13 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.stats import rankdata
 from .config import ANALYSIS_VERSION
-from .data import log, read_annotation, ActivationStore
+from .data import log, read_annotation, ActivationStore, MatchShardStore
 from .statistics import (average_precision, domain_precision_recall_f1,
                          event_enrichment_with_block_bootstrap,
                          genomic_block_ids)
@@ -199,6 +200,8 @@ def cmd_match(argv):
     ap.add_argument("--mode", choices=["raw", "sae"], required=True)
     ap.add_argument("--sae", help="SAE checkpoint (mode=sae)")
     ap.add_argument("--act-dir", default="activations")
+    ap.add_argument("--tap", default=None,
+                    help="Required for native extract.py caches (128-bp tower tap only)")
     ap.add_argument("--ann", default="annotation_matrix.parquet")
     ap.add_argument("--split", default="test")
     ap.add_argument("--n-control", type=int, default=1000,
@@ -207,7 +210,7 @@ def cmd_match(argv):
     ap.add_argument("--null-mode", choices=["circular", "global"], default="circular")
     ap.add_argument("--null-seed", type=int, default=0)
     ap.add_argument("--panel", default=None,
-                    help="concept_panel_v2.json; verilmezse v1 ORIGINAL_8 paneli kullanilir")
+                    help="Frozen concept panel JSON; if omitted, use the legacy ORIGINAL_8 panel")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch-size", type=int, default=1024, help="SAE encoding batch size")
     ap.add_argument("--workers", type=int, default=1,
@@ -227,18 +230,32 @@ def cmd_match(argv):
     CONCEPTS, PRIMARY, EXPLORATORY, ROLES = resolve_concepts(ann, args.panel)
     log(f"concepts: {len(CONCEPTS)} total | primary {len(PRIMARY)} | exploratory {len(EXPLORATORY)}")
     sel = (ann.split == args.split).values & ann.n_mask.values
-    Y = ann.loc[sel, CONCEPTS].values.astype(bool)
+
+    # The native extractor writes a multi-tap index.json layout. The older
+    # ActivationStore format remains supported for existing single-tap caches.
+    if (Path(args.act_dir) / "index.json").is_file():
+        if not args.tap:
+            raise ValueError("--tap is required when --act-dir is a native extract.py cache")
+        data = MatchShardStore(args.act_dir, args.tap, args.split, ann)
+        aligned_ann = ann.iloc[data.annotation_indices]
+        Y = aligned_ann[CONCEPTS].values.astype(bool)
+        match_coords = data.coordinates()[["chrom", "bin_start", "bin_end"]]
+    else:
+        if args.tap:
+            raise ValueError("--tap is only used with a native extract.py index.json cache")
+        data = ActivationStore(args.act_dir, args.split, ann)
+        Y = ann.loc[sel, CONCEPTS].values.astype(bool)
+        match_coords = ann.loc[sel, ["chrom", "bin_start", "bin_end"]]
+
     if args.n_control < 1:
         raise ValueError("--n-control must be positive")
     constant = [c for c, y in zip(CONCEPTS, Y.T) if not y.any() or y.all()]
     if constant:
         raise ValueError(f"AUROC is undefined for constant concepts in {args.split}: {constant}")
-    runs = genomic_runs(ann.loc[sel, ["chrom", "bin_start", "bin_end"]])
+    runs = genomic_runs(match_coords)
     if args.null_mode == "circular" and not any(len(r) > 1 for r in runs):
         raise ValueError("No contiguous genomic runs available for circular permutations")
 
-    # load activations for split, apply same mask
-    data = ActivationStore(args.act_dir, args.split, ann)
     if (args.batch_size < 1 or args.workers < 1
             or args.dense_rank_chunk < 1 or args.dense_score_chunk < 1):
         raise ValueError("batch-size, workers, and dense chunks must be positive")

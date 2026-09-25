@@ -189,7 +189,8 @@ class ActivationStore:
 
     def take(self, indices):
         indices = np.asarray(indices, dtype=np.int64)
-        if (indices < 0).any() or (indices >= len(self)).any():
+        if (indices.ndim != 1 or (indices < 0).any()
+                or (indices >= len(self)).any()):
             raise IndexError("Activation row index out of bounds")
         rows = self.rows[indices]
         shards = np.searchsorted(self.ends, rows, side="right")
@@ -219,3 +220,90 @@ class ActivationStore:
             mean += delta * n / (count + n)
             count += n
         return mean.astype(np.float32), float(m2.sum())
+
+
+class MatchShardStore:
+    """Coordinate-align a native ``extract.py`` tower cache for matching.
+
+    The trainer's ``ShardStore`` layout is multi-tap and uses ``index.json``;
+    the historical ``ActivationStore`` layout is a single-tap v2 cache. This
+    adapter lets matching consume the native layout without rewriting data.
+    Concept annotations are defined on the 128-bp grid, so encoder taps at
+    4/16/64 bp are deliberately rejected rather than silently misaligned.
+    """
+
+    def __init__(self, directory, tap, split, ann):
+        from .extract import ShardStore, TAPS
+
+        ann = ann.reset_index(drop=True)
+        validate_coordinates(ann)
+        if "n_mask" not in ann:
+            raise ValueError("Annotation table is missing n_mask")
+        if tap not in TAPS:
+            raise ValueError(f"Unknown activation tap: {tap!r}")
+        if TAPS[tap].bin_bp != BIN_BP:
+            raise ValueError(
+                f"Matching requires a 128-bp tower tap; {tap!r} is {TAPS[tap].bin_bp} bp"
+            )
+        self.store = ShardStore(directory, tap, split)
+        self.dim = self.store.dim
+        coords = self.store.coordinates().reset_index(drop=True)
+        validate_coordinates(coords)
+        if not (coords.split == split).all():
+            raise ValueError("Activation shard contains rows from another split")
+
+        # Index annotations by exact half-open coordinates. The activation
+        # cache may sample a subset of bins, so equality of whole tables is
+        # neither expected nor required; every cached row must map uniquely.
+        lookup = {}
+        for idx, row in ann.iterrows():
+            if str(row.split) != str(split):
+                continue
+            key = (str(row.chrom), int(row.bin_start), int(row.bin_end), str(row.split))
+            if key in lookup:
+                raise ValueError(f"Duplicate annotation coordinate: {key}")
+            lookup[key] = int(idx)
+
+        annotation_rows = []
+        for row in coords.itertuples(index=False):
+            key = (str(row.chrom), int(row.bin_start), int(row.bin_end), str(row.split))
+            if key not in lookup:
+                raise ValueError(f"Activation coordinate is absent from annotations: {key}")
+            annotation_rows.append(lookup[key])
+        mapped = np.asarray(annotation_rows, dtype=np.int64)
+        valid = boolean_mask(ann.n_mask.to_numpy())[mapped]
+        self.row_indices = np.flatnonzero(valid)
+        self.annotation_indices = mapped[self.row_indices]
+        self._coordinates = coords.iloc[self.row_indices].reset_index(drop=True)
+        if not len(self.row_indices):
+            raise ValueError(f"Split {split} has no valid matched activation rows")
+
+        # Verify both arrays and coordinate sidecars against the extraction
+        # index before trusting their row correspondence.
+        for record in self.store.records:
+            for field, checksum in (("activations", "activations_sha256"),
+                                    ("coordinates", "coordinates_sha256")):
+                path = Path(directory) / record[field]
+                if not path.is_file() or sha256(path) != record[checksum]:
+                    raise ValueError(f"Missing or corrupt activation shard: {path.name}")
+        self.identity = {**self.store.identity,
+                         "annotation_indices_sha256": hashlib.sha256(
+                             self.annotation_indices.tobytes()).hexdigest()}
+
+    def __len__(self):
+        return len(self.row_indices)
+
+    def take(self, indices):
+        indices = np.asarray(indices, dtype=np.int64)
+        if (indices < 0).any() or (indices >= len(self)).any():
+            raise IndexError("Activation row index out of bounds")
+        return self.store.take(self.row_indices[indices])
+
+    def batches(self, batch_size=8192):
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        for start in range(0, len(self), batch_size):
+            yield self.take(np.arange(start, min(start + batch_size, len(self))))
+
+    def coordinates(self):
+        return self._coordinates.copy()

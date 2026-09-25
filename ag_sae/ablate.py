@@ -5,10 +5,11 @@ asks the causal question: if the feature's contribution is removed from the
 activation the model goes on to use, do the model's own predictions change, and
 do they change more at the concept's sites than elsewhere?
 
-The ablation is done in the SAE's basis. At the tap, the activation is encoded,
-the chosen features' contribution is subtracted using the decoder columns the
-SAE actually learned, and the residual is put back. Nothing else in the forward
-pass is touched, so any change in the output is attributable to those features.
+The ablation is done in the SAE's basis. For the Borzoi SAE, interventions must
+invert both per-channel scaling and the row-wise LayerNorm used by the encoder.
+The low-level matrix helper below is only valid when activations and decoder
+directions are already expressed in the same coordinate system; use
+``ablate_sae_features`` for raw activations and a BorzoiSAE checkpoint.
 
 Two controls decide whether a result means anything.
 
@@ -28,7 +29,11 @@ import pandas as pd
 
 
 def decoder_directions(checkpoint: str) -> np.ndarray:
-    """(n_features, d_in) decoder columns from an inference checkpoint."""
+    """(n_features, d_in) decoder columns in the SAE's normalized space.
+
+    These are not raw AlphaGenome-space directions: converting them to a raw
+    activation edit also needs the row's LayerNorm std and channel_scale.
+    """
     import torch
 
     blob = torch.load(checkpoint, map_location="cpu", weights_only=True)
@@ -43,11 +48,11 @@ def ablate_activation(
     directions: np.ndarray,
     features: Sequence[int],
 ) -> np.ndarray:
-    """Subtract the chosen features' reconstruction from the activation.
+    """Subtract contributions when all inputs are already in the same space.
 
-    `codes` and `activation` are row-aligned; `directions` holds one row per
-    feature. Only the listed features are removed, so everything the SAE did not
-    attribute to them is left exactly as it was.
+    This is a low-level linear helper. It does not invert BorzoiSAE's
+    per-channel scaling or row-wise LayerNorm. For raw model activations, use
+    :func:`ablate_sae_features` instead.
     """
     activation = np.asarray(activation, dtype=np.float32)
     codes = np.asarray(codes, dtype=np.float32)
@@ -61,6 +66,57 @@ def ablate_activation(
     if (features < 0).any() or (features >= directions.shape[0]).any():
         raise ValueError("feature index outside the dictionary")
     return activation - codes[:, features] @ directions[features]
+
+
+def ablate_sae_features(sae, activation, features: Sequence[int],
+                        positions: Sequence[int] | None = None):
+    """Remove SAE latents from raw activation rows, preserving the SAE residual.
+
+    ``activation`` must be a torch tensor with shape ``(positions, channels)``.
+    The decoder difference is reconstructed with the exact row-wise LayerNorm
+    parameters and channel scaling from the checkpoint, then added to the raw
+    activation. If ``positions`` is supplied, all other rows remain untouched.
+    """
+    import torch
+
+    if not torch.is_tensor(activation) or activation.ndim != 2:
+        raise ValueError("activation must be a 2-D torch tensor")
+    if activation.shape[1] != sae.d_in:
+        raise ValueError("activation width does not match the SAE")
+    chosen = np.asarray(list(features), dtype=np.int64)
+    if positions is None:
+        rows = np.arange(len(activation), dtype=np.int64)
+    else:
+        rows = np.asarray(list(positions), dtype=np.int64)
+        if rows.ndim != 1 or (rows < 0).any() or (rows >= len(activation)).any():
+            raise ValueError("position index outside activation rows")
+        if len(np.unique(rows)) != len(rows):
+            raise ValueError("positions must not contain duplicates")
+    if chosen.size == 0 or rows.size == 0:
+        return activation.clone()
+    if (chosen < 0).any() or (chosen >= sae.hidden).any():
+        raise ValueError("feature index outside the dictionary")
+    if len(np.unique(chosen)) != len(chosen):
+        raise ValueError("features must not contain duplicates")
+
+    device = sae.channel_scale.device
+    if activation.device != device:
+        raise ValueError("SAE and activation must be on the same device")
+    scale = sae.channel_scale.float()
+    raw = activation[torch.as_tensor(rows, dtype=torch.long, device=device)].float()
+    hidden, params = sae.core.encode(raw / scale)
+    codes = sae.core.get_sparse_activations(sae.core.activation(hidden))
+    edited_codes = codes.clone()
+    edited_codes[:, chosen.tolist()] = 0
+    reconstructed = sae.core.decode(codes, params) * scale
+    changed = sae.core.decode(edited_codes, params) * scale
+    if not torch.isfinite(reconstructed).all() or not torch.isfinite(changed).all():
+        raise ValueError("Nonfinite SAE reconstruction or feature edit")
+
+    result = activation.clone()
+    row_tensor = torch.as_tensor(rows, dtype=torch.long, device=device)
+    result[row_tensor] = (raw + changed - reconstructed).to(activation.dtype)
+    return result
 
 
 def matched_controls(
@@ -231,22 +287,25 @@ def paired_permutation_p(
 #: `decoder(trunk, intermediates)`, which produces the 1 bp resolution output.
 #: So the two kinds of tap do not intervene on the same thing:
 #:
-#:   tower tap  -> everything downstream: tower, 128 bp embedder, every head
+#:   tower hook -> MHA branch at that block, then downstream tower and heads
 #:   conv tap   -> the skip connection only, so the 1 bp heads and not the
 #:                 128 bp ones, and it asks what the skip carries rather than
 #:                 what the conv layer computes
 #:
 #: A conv-tap ablation scored against 128 bp tracks would show no effect and
 #: the reason would be architectural, not biological.
-TOWER_AFFECTS = "all outputs"
+TOWER_AFFECTS = "MHA branch and downstream outputs (not pair-update or shortcut input)"
 CONV_AFFECTS = "1 bp resolution outputs only"
 
 
 class Intervention:
-    """Replace a tap's activation during the forward pass.
+    """Edit the selected branch at a tap during the forward pass.
 
     `replace` receives the captured activation as (positions, channels) and
-    returns the same shape. Install once, call the model, remove.
+    returns the same shape. Tower taps hook the MHA input only; they do not
+    rewrite the pair-update or residual-shortcut inputs. This class therefore
+    implements an attention-path diagnostic, not a full-stream block edit.
+    Install once, call the model, remove.
     """
 
     def __init__(self, model, tap, replace: Callable[[np.ndarray], np.ndarray]) -> None:
@@ -300,11 +359,13 @@ def feature_remover(
     codes: np.ndarray, directions: np.ndarray, features: Sequence[int],
     positions: np.ndarray | None = None,
 ) -> Callable[[np.ndarray], np.ndarray]:
-    """A `replace` function that subtracts the chosen features' contribution.
+    """Build a low-level linear replacement for activations already in one space.
 
     `positions` maps each row of `codes` to a row of the activation, for the
     case where only a sample of positions was encoded. Rows the SAE never saw
-    are left untouched rather than guessed at.
+    are left untouched rather than guessed at. This helper does not undo
+    BorzoiSAE's row normalization or channel scaling; use
+    :func:`ablate_sae_features` for raw Borzoi activations.
     """
     def replace(activation: np.ndarray) -> np.ndarray:
         out = np.array(activation, dtype=np.float32, copy=True)
