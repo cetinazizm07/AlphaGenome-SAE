@@ -19,10 +19,10 @@ class TestSafeWilcoxon(unittest.TestCase):
         self.assertEqual(stat, 0.0)
         self.assertEqual(p, 1.0)
 
-    def test_identical_differences_returns_null_hypothesis(self):
+    def test_identical_nonzero_differences_computes_significance(self):
         stat, p = safe_wilcoxon(np.ones(15) * 0.5)
-        self.assertEqual(stat, 0.0)
-        self.assertEqual(p, 1.0)
+        self.assertGreaterEqual(stat, 0.0)
+        self.assertLess(p, 0.01)
 
     def test_genuine_paired_differences(self):
         rng = np.random.default_rng(42)

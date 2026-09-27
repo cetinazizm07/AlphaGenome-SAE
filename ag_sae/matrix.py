@@ -49,12 +49,19 @@ def run_matrix_campaign(
         print(f"\n>>> [STEP {step}/{total}] Configuration: {config_name}")
 
         if triad_file.is_file() and gene_file.is_file():
-            print(f"  [SKIPPED] {config_name} is already complete and verified on disk.")
+            if not dry_run and drive_remote:
+                target_drive_path = f"{drive_remote.rstrip('/')}/{config_name}/"
+                sync_cmd = ["rclone", "copy", f"{out_dir}/", target_drive_path, "--checksum", "-q"]
+                sync_res = subprocess.run(sync_cmd, capture_output=True, text=True)
+                if sync_res.returncode != 0:
+                    print(f"\n[ERROR] Google Drive sync failed for completed config {config_name} with returncode {sync_res.returncode}: {sync_res.stderr.strip()}", file=sys.stderr)
+                    sys.exit(sync_res.returncode)
+            print(f"  [SKIPPED] {config_name} is already complete and verified on disk & remote.")
             completed_count += 1
             continue
 
         cmd = [
-            sys.executable, "-u", "-m", "ag_sae.intervene",
+            sys.executable, "-u", "-m", "ag_sae", "intervene",
             "--fold", fold,
             "--layer", layer,
             "--seed", seed,
@@ -73,6 +80,10 @@ def run_matrix_campaign(
             print(f"\n[ERROR] Step {step}/{total} failed with returncode {result.returncode} for {config_name}!", file=sys.stderr)
             sys.exit(result.returncode)
 
+        if not triad_file.is_file() or not gene_file.is_file():
+            print(f"\n[ERROR] Step {step}/{total} finished but output files are missing on disk for {config_name}!", file=sys.stderr)
+            sys.exit(1)
+
         elapsed = time.time() - t0
         print(f"  [SUCCESS] Finished {config_name} in {elapsed:.1f}s!")
 
@@ -80,8 +91,11 @@ def run_matrix_campaign(
         if drive_remote:
             target_drive_path = f"{drive_remote.rstrip('/')}/{config_name}/"
             print(f"  Syncing to Google Drive ({target_drive_path})...")
-            sync_cmd = f"rclone copy {out_dir}/ {target_drive_path} --checksum -q"
-            os.system(sync_cmd)
+            sync_cmd = ["rclone", "copy", f"{out_dir}/", target_drive_path, "--checksum", "-q"]
+            sync_res = subprocess.run(sync_cmd, capture_output=True, text=True)
+            if sync_res.returncode != 0:
+                print(f"\n[ERROR] Google Drive sync failed for {config_name} with returncode {sync_res.returncode}: {sync_res.stderr.strip()}", file=sys.stderr)
+                sys.exit(sync_res.returncode)
 
         completed_count += 1
 

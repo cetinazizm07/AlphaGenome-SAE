@@ -43,12 +43,10 @@ def safe_wilcoxon(deltas: np.ndarray) -> tuple[float, float]:
     """Compute Wilcoxon signed-rank test safely.
 
     Guards against scipy ValueError when all differences are zero (e.g. silent
-    sparse features that never fire in any window) or identical.
+    sparse features that never fire in any window).
     """
     arr = np.asarray(deltas, dtype=np.float64)
-    if len(arr) == 0:
-        return 0.0, 1.0
-    if np.all(arr == 0) or len(np.unique(arr)) <= 1:
+    if len(arr) == 0 or np.all(arr == 0):
         return 0.0, 1.0
     try:
         w_stat, w_p = stats.wilcoxon(arr, alternative="two-sided")
@@ -78,7 +76,7 @@ def compute_paired_statistics(deltas: np.ndarray) -> StatisticalSummary:
     med_val = float(np.median(arr))
     pct_neg = float(np.mean(arr < 0)) * 100.0
 
-    if np.all(arr == 0) or len(np.unique(arr)) <= 1:
+    if len(arr) < 2:
         return StatisticalSummary(
             mean_delta=mean_val,
             median_delta=med_val,
@@ -86,6 +84,31 @@ def compute_paired_statistics(deltas: np.ndarray) -> StatisticalSummary:
             t_p_value=1.0,
             wilcoxon_w=0.0,
             wilcoxon_p_value=1.0,
+            pct_negative=pct_neg,
+        )
+
+    if np.all(arr == 0):
+        return StatisticalSummary(
+            mean_delta=0.0,
+            median_delta=0.0,
+            t_statistic=0.0,
+            t_p_value=1.0,
+            wilcoxon_w=0.0,
+            wilcoxon_p_value=1.0,
+            pct_negative=0.0,
+        )
+
+    if len(np.unique(arr)) == 1:
+        w_stat, w_p = safe_wilcoxon(arr)
+        t_stat = float("inf") if mean_val > 0 else float("-inf")
+        t_p = 0.0
+        return StatisticalSummary(
+            mean_delta=mean_val,
+            median_delta=med_val,
+            t_statistic=t_stat,
+            t_p_value=t_p,
+            wilcoxon_w=w_stat,
+            wilcoxon_p_value=w_p,
             pct_negative=pct_neg,
         )
 

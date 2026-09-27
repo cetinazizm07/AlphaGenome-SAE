@@ -179,5 +179,24 @@ class TestContiguousWritableConversion(unittest.TestCase):
             self.assertEqual(tensor.shape, (10, 10))
 
 
+class TestCacheIsolationBetweenFolds(unittest.TestCase):
+    def test_different_manifest_coordinates_produce_different_cache_keys(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gtf_path = tmp_path / "mock.gtf"
+            gtf_path.write_text('chr1\tHAVANA\ttranscript\t100\t500\t.\t+\t.\tgene_name "G1"; transcript_id "T1";\n')
+
+            manifest_fold1 = pd.DataFrame({"chrom": ["chr1"], "win_start": [1000], "win_end": [2000], "split": ["test"]})
+            manifest_fold2 = pd.DataFrame({"chrom": ["chr2"], "win_start": [5000], "win_end": [6000], "split": ["test"]})
+            annotations = pd.DataFrame({"split": ["test"], "chrom": ["chr1"], "bin_start": [0], "cCRE_PLS": [False]})
+            cache_dir = tmp_path / "cache"
+
+            res1 = eligible_genes(gtf_path, manifest_fold1, annotations, cache_dir=cache_dir)
+            res2 = eligible_genes(gtf_path, manifest_fold2, annotations, cache_dir=cache_dir)
+
+            cache_files = list(cache_dir.glob("eligible_genes_*.json"))
+            self.assertEqual(len(cache_files), 2, "Different fold manifests must produce distinct cache files")
+
+
 if __name__ == "__main__":
     unittest.main()

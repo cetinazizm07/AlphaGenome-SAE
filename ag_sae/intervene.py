@@ -17,6 +17,7 @@ import gc
 import gzip
 import hashlib
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,61 +183,70 @@ def discover_concept_features(
     diffs: dict[str, list[np.ndarray]] = {c: [] for c in concepts}
     scale = sae.channel_scale.float().to("cuda")
 
-    for window in calibration_windows[:max_calibration_windows]:
-        chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
-        seq = chrom_sequence(fasta_path, chrom)[start:end]
-        onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
+    with torch.no_grad():
+        for window in calibration_windows[:max_calibration_windows]:
+            chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
+            seq = chrom_sequence(fasta_path, chrom)[start:end]
+            onehot = sequence_to_onehot(seq).astype(np.float32)
+            input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
 
-        bins = annotations.loc[
-            (annotations.split == "test") & (annotations.chrom == chrom)
-            & (annotations.bin_start >= start) & (annotations.bin_start < end)
-        ].sort_values("bin_start").reset_index(drop=True)
+            bins = annotations.loc[
+                (annotations.chrom == chrom)
+                & (annotations.bin_start >= start) & (annotations.bin_start < end)
+            ].sort_values("bin_start").reset_index(drop=True)
 
-        captured: list[np.ndarray] = []
+            captured: list[np.ndarray] = []
 
-        def capture_fn(val):
-            captured.append(np.array(val, dtype=np.float32, copy=True))
-            return val
+            def capture_fn(val):
+                captured.append(np.array(val, dtype=np.float32, copy=True))
+                return val
 
-        with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
-            _ = model.predict(input_tensor, organism, resolutions=(128,), heads=("atac",), channels_last=True)
+            with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
+                _ = model.predict(input_tensor, organism, resolutions=(128,), heads=("atac",), channels_last=True)
 
-        acts = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
-        raw = acts[0].float()
-        pre, _ = sae.core.encode(raw / scale)
-        codes = sae.core.get_sparse_activations(sae.core.activation(pre))
+            acts = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
+            raw = acts[0].float()
+            pre, _ = sae.core.encode(raw / scale)
+            codes = sae.core.get_sparse_activations(sae.core.activation(pre))
 
-        for c in concepts:
-            col = c
-            if c not in bins.columns and c == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
-                col = "cCRE_CTCF-only"
-            if col not in bins.columns:
-                continue
+            for c in concepts:
+                col = c
+                if c not in bins.columns and c == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
+                    col = "cCRE_CTCF-only"
+                if col not in bins.columns:
+                    continue
 
-            mask = bins[col].to_numpy(bool)
-            if mask.sum() > 0 and (~mask).sum() > 0:
-                pos = codes[mask].mean(dim=0).cpu().numpy()
-                neg = codes[~mask].mean(dim=0).cpu().numpy()
-                diffs[c].append(pos - neg)
+                mask = bins[col].to_numpy(bool)
+                if mask.sum() > 0 and (~mask).sum() > 0:
+                    pos = codes[mask].mean(dim=0).detach().cpu().numpy()
+                    neg = codes[~mask].mean(dim=0).detach().cpu().numpy()
+                    diffs[c].append(pos - neg)
 
-        del input_tensor, acts, raw, pre, codes, captured
-        cleanup_gpu()
+            del input_tensor, acts, raw, pre, codes, captured
+            cleanup_gpu()
 
+    DEFAULT_FEATURES = {
+        "cCRE_PLS": 199,
+        "cCRE_CTCF_only": 4586,
+        "cCRE_pELS": 7205,
+        "shuffled_dELS": 5454,
+    }
     discovered: dict[str, int] = {}
     for c in concepts:
         if len(diffs[c]) > 0:
             avg_diff = np.mean(diffs[c], axis=0)
             discovered[c] = int(np.argmax(avg_diff))
         else:
-            discovered[c] = 0
+            default_id = DEFAULT_FEATURES.get(c, 199)
+            print(f"[Feature Discovery] No contrastive bins found for {c}; falling back to pinned feature {default_id}")
+            discovered[c] = default_id
 
     cleanup_gpu()
     return DiscoveredFeatures(
-        promoter_feature_id=discovered.get("cCRE_PLS", 199),
-        insulator_feature_id=discovered.get("cCRE_CTCF_only", 4586),
-        enhancer_feature_id=discovered.get("cCRE_pELS", 7205),
-        shuffled_control_feature_id=discovered.get("shuffled_dELS", 5454),
+        promoter_feature_id=discovered["cCRE_PLS"],
+        insulator_feature_id=discovered["cCRE_CTCF_only"],
+        enhancer_feature_id=discovered["cCRE_pELS"],
+        shuffled_control_feature_id=discovered["shuffled_dELS"],
     )
 
 
@@ -287,6 +297,10 @@ def run_triad_ablation(
             intervention_mask = bins["cCRE_any"].to_numpy(bool)
         else:
             intervention_mask = bins["cCRE_PLS"].to_numpy(bool)
+
+        if "shuffled_dELS" in bins.columns:
+            intervention_mask = intervention_mask | bins["shuffled_dELS"].to_numpy(bool)
+
         selected_bins = np.flatnonzero(intervention_mask)
 
         seq = chrom_sequence(fasta_path, chrom)[start:end]
@@ -353,21 +367,26 @@ def run_triad_ablation(
                 "feature_id": feat, "fired_bins": fired_count, "heads": {}
             }
 
+            eval_mask = (elem_mask & intervention_mask) if (elem_mask & intervention_mask).any() else elem_mask
+            has_concept_bins = bool(eval_mask.any())
             for head in ALL_HEADS:
                 recon = arrays[f"{head}_reconstruction"]
                 abl = arrays[f"{head}_ablate_{cname}"]
                 delta = abl - recon
                 win_data["features"][cname]["heads"][head] = {
-                    "delta_on_concept": float(delta[elem_mask].mean()) if elem_mask.any() else 0.0,
+                    "delta_on_concept": float(delta[eval_mask].mean()) if has_concept_bins else None,
                     "delta_on_all_regulatory": float(delta[intervention_mask].mean()) if intervention_mask.any() else 0.0,
+                    "has_concept_bins": has_concept_bins,
                 }
 
         window_results.append(win_data)
         elapsed = time.time() - t0
         p_atac = win_data["features"]["PLS_Promoter"]["heads"]["atac"]["delta_on_concept"]
         c_tf = win_data["features"]["CTCF_Insulator"]["heads"]["chip_tf"]["delta_on_concept"]
+        p_str = f"{p_atac:+.4f}" if p_atac is not None else "N/A"
+        c_str = f"{c_tf:+.4f}" if c_tf is not None else "N/A"
         if (wi + 1) % 5 == 0 or wi == 0:
-            print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {p_atac:+.4f} | CTCF TF: {c_tf:+.4f} ({elapsed:.1f}s)", flush=True)
+            print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {p_str} | CTCF TF: {c_str} ({elapsed:.1f}s)", flush=True)
 
         del input_tensor, activation, baseline_act, captured, arrays, raw, pre, codes, rebuilt
         cleanup_gpu()
@@ -378,9 +397,26 @@ def run_triad_ablation(
     for cname, (feat, track_col) in target_classes.items():
         summary_stats[cname] = {"feature_id": feat, "heads": {}}
         for head in ALL_HEADS:
-            deltas = np.array([w["features"][cname]["heads"][head]["delta_on_concept"] for w in window_results])
-            stats_summary = compute_paired_statistics(deltas)
-            summary_stats[cname]["heads"][head] = stats_summary.to_dict()
+            deltas = np.array([
+                w["features"][cname]["heads"][head]["delta_on_concept"]
+                for w in window_results
+                if w["features"][cname]["heads"][head]["delta_on_concept"] is not None
+            ], dtype=np.float64)
+            if len(deltas) >= 2:
+                stats_summary = compute_paired_statistics(deltas)
+                summary_stats[cname]["heads"][head] = stats_summary.to_dict()
+                summary_stats[cname]["heads"][head]["n_measured_windows"] = len(deltas)
+            else:
+                summary_stats[cname]["heads"][head] = {
+                    "mean_delta": float(np.mean(deltas)) if len(deltas) == 1 else 0.0,
+                    "median_delta": float(np.median(deltas)) if len(deltas) == 1 else 0.0,
+                    "t_stat": 0.0,
+                    "t_p": 1.0,
+                    "wilcoxon_w": 0.0,
+                    "wilcoxon_p": 1.0,
+                    "pct_negative": 0.0,
+                    "n_measured_windows": len(deltas),
+                }
 
     (out_dir / "regulatory_triad_summary.json").write_text(json.dumps(summary_stats, indent=2))
     print(f"Ablation complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'regulatory_triad_summary.json'}")
@@ -557,15 +593,21 @@ def eligible_genes(
     except OSError:
         gtf_info = str(gtf_path)
 
-    manifest_len = len(manifest)
-    if "split" in annotations.columns:
-        test_ann_len = len(annotations.loc[annotations.split == "test"])
-        ann_splits = str(sorted(annotations["split"].dropna().unique()))
-        ann_info = f"test_len:{test_ann_len}_splits:{ann_splits}"
+    manifest_cols = [c for c in ["chrom", "win_start", "start", "end", "win_end", "split"] if c in manifest.columns]
+    if manifest_cols:
+        m_bytes = pd.util.hash_pandas_object(manifest[manifest_cols], index=False).to_numpy().tobytes()
+        manifest_sig = hashlib.sha256(m_bytes).hexdigest()[:16]
     else:
-        ann_info = f"len:{len(annotations)}"
+        manifest_sig = str(len(manifest))
 
-    key_str = f"gtf:{gtf_info}|manifest_len:{manifest_len}|ann:{ann_info}"
+    ann_cols = [c for c in ["chrom", "bin_start", "cCRE_PLS", "split"] if c in annotations.columns]
+    if ann_cols:
+        a_bytes = pd.util.hash_pandas_object(annotations[ann_cols], index=False).to_numpy().tobytes()
+        ann_sig = hashlib.sha256(a_bytes).hexdigest()[:16]
+    else:
+        ann_sig = str(len(annotations))
+
+    key_str = f"gtf:{gtf_info}|m_sig:{manifest_sig}|a_sig:{ann_sig}|m_len:{len(manifest)}"
     cache_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
 
     cache_root = Path(cache_dir) if cache_dir is not None else Path("/tmp/ag_cache")
@@ -803,18 +845,30 @@ def run_gene_injection_cohort(
         "n_total_eligible": n_genes, "n_measured": len(measured_genes), "modalities": {}
     }
 
-    for m in TRANSCRIPTIONAL_HEADS:
-        diffs = [g["effects"][m]["paired_difference"] for g in measured_genes]
-        stats_summary = compute_paired_statistics(np.array(diffs))
-        gene_stats["modalities"][m] = {
-            "mean_paired_difference": stats_summary.mean_delta,
-            "median_paired_difference": stats_summary.median_delta,
-            "t_stat": stats_summary.t_statistic,
-            "t_p_value": stats_summary.t_p_value,
-            "wilcoxon_w": stats_summary.wilcoxon_w,
-            "wilcoxon_p_value": stats_summary.wilcoxon_p_value,
-            "fraction_target_greater_than_control": float(np.mean(np.array(diffs) > 0)),
-        }
+    if len(measured_genes) == 0:
+        for m in TRANSCRIPTIONAL_HEADS:
+            gene_stats["modalities"][m] = {
+                "mean_paired_difference": 0.0,
+                "median_paired_difference": 0.0,
+                "t_stat": 0.0,
+                "t_p_value": 1.0,
+                "wilcoxon_w": 0.0,
+                "wilcoxon_p_value": 1.0,
+                "fraction_target_greater_than_control": 0.0,
+            }
+    else:
+        for m in TRANSCRIPTIONAL_HEADS:
+            diffs = [g["effects"][m]["paired_difference"] for g in measured_genes]
+            stats_summary = compute_paired_statistics(np.array(diffs))
+            gene_stats["modalities"][m] = {
+                "mean_paired_difference": stats_summary.mean_delta,
+                "median_paired_difference": stats_summary.median_delta,
+                "t_stat": stats_summary.t_statistic,
+                "t_p_value": stats_summary.t_p_value,
+                "wilcoxon_w": stats_summary.wilcoxon_w,
+                "wilcoxon_p_value": stats_summary.wilcoxon_p_value,
+                "fraction_target_greater_than_control": float(np.mean(np.array(diffs) > 0)),
+            }
 
     (out_dir / "gene_level_statistical_summary.json").write_text(json.dumps(gene_stats, indent=2))
     print(f"Gene cohort complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'gene_level_statistical_summary.json'}")
@@ -860,6 +914,26 @@ def run_single_configuration(
             for row in manifest.loc[manifest.split == "test"].head(40).itertuples()
         ]
 
+    # Use strictly disjoint calibration windows for feature discovery to guarantee zero data leakage
+    eval_keys = {(w["chrom"], w["start"], w["end"]) for w in windows}
+    calib_slice = manifest.loc[manifest.split.isin(["val", "train"])]
+    if len(calib_slice) > 0:
+        calib_candidates = [
+            {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
+            for row in calib_slice.itertuples()
+            if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
+        ]
+    else:
+        calib_candidates = [
+            {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
+            for row in manifest.itertuples()
+            if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
+        ]
+
+    if not calib_candidates:
+        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available in manifest outside evaluation windows.")
+    calib_windows = calib_candidates[:10]
+
     # 2. Load models
     print(f"Loading SAE from {sae_path}...")
     tap = TAPS[layer]
@@ -871,7 +945,7 @@ def run_single_configuration(
     organism = torch.tensor([0], device="cuda")
 
     # 3. Dynamic Feature Discovery
-    features = discover_concept_features(sae, model, tap, windows, annotations, fasta_path, organism)
+    features = discover_concept_features(sae, model, tap, calib_windows, annotations, fasta_path, organism)
 
     # 4. Regulatory Triad Ablation
     triad_summary_file = out_dir / "regulatory_triad_summary.json"
@@ -942,3 +1016,7 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
         out_dir=out, plan_path=plan, cache_dir=args.cache_dir
     )
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cmd_intervene())
