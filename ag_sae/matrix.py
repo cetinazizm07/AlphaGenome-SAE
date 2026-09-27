@@ -8,6 +8,7 @@ to prevent GPU memory leaks, automatic checkpoint resumption, and checksum-verif
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,22 @@ from pathlib import Path
 
 DEFAULT_LAYERS: tuple[str, ...] = ("resid_pre_b8", "resid_pre_b4", "resid_pre_b0")
 DEFAULT_SEEDS: tuple[str, ...] = ("seed0", "seed1", "seed2")
+
+
+def is_valid_json_file(path: Path | str | None) -> bool:
+    """Return True if path points to an existing, non-empty, parseable JSON file."""
+    if path is None:
+        return False
+    target = Path(path)
+    if not target.is_file() or target.stat().st_size == 0:
+        return False
+    try:
+        with open(target, "rb") as f:
+            json.load(f)
+        return True
+    except Exception:
+        return False
+
 
 
 def run_matrix_campaign(
@@ -48,7 +65,7 @@ def run_matrix_campaign(
 
         print(f"\n>>> [STEP {step}/{total}] Configuration: {config_name}")
 
-        if triad_file.is_file() and gene_file.is_file():
+        if is_valid_json_file(triad_file) and is_valid_json_file(gene_file):
             if not dry_run and drive_remote:
                 target_drive_path = f"{drive_remote.rstrip('/')}/{config_name}/"
                 sync_cmd = ["rclone", "copy", f"{out_dir}/", target_drive_path, "--checksum", "-q"]
@@ -80,8 +97,8 @@ def run_matrix_campaign(
             print(f"\n[ERROR] Step {step}/{total} failed with returncode {result.returncode} for {config_name}!", file=sys.stderr)
             sys.exit(result.returncode)
 
-        if not triad_file.is_file() or not gene_file.is_file():
-            print(f"\n[ERROR] Step {step}/{total} finished but output files are missing on disk for {config_name}!", file=sys.stderr)
+        if not is_valid_json_file(triad_file) or not is_valid_json_file(gene_file):
+            print(f"\n[ERROR] Step {step}/{total} finished but output files are missing or corrupt on disk for {config_name}!", file=sys.stderr)
             sys.exit(1)
 
         elapsed = time.time() - t0

@@ -137,7 +137,33 @@ def run_review(
         # Passing instructions alone automatically reviews current working tree changes.
         pass
 
-    if instructions:
+    if instructions and (commit or base):
+        # Codex CLI v0.157.1 clap parser rejects combining scope flags (--commit/--base) with [PROMPT].
+        # To preserve custom review instructions faithfully without dropping them, route through `codex exec`
+        # with the git diff attached.
+        git_cmd = ["git", "show", commit] if commit else ["git", "diff", f"{base}...HEAD"]
+        diff_proc = subprocess.run(git_cmd, cwd=cd, capture_output=True, text=True)
+        if diff_proc.returncode != 0:
+            print(f"[Error] Failed to compute git diff: {diff_proc.stderr.strip()}", file=sys.stderr)
+            return diff_proc.returncode
+
+        target_label = f"commit {commit}" if commit else f"base branch {base}"
+        exec_prompt = (
+            f"Perform a rigorous code review of the following changes against {target_label}.\n\n"
+            f"Review Instructions: {instructions}\n\n"
+            f"```diff\n{diff_proc.stdout}\n```"
+        )
+        print(f"[*] Preserving custom instructions for {target_label} via scoped review bridge...")
+        return run_exec(
+            codex_bin=codex_bin,
+            prompt=exec_prompt,
+            cd=cd,
+            sandbox="read-only",
+            model=model,
+            output_file=output_file,
+        )
+
+    if instructions and not (commit or base):
         cmd.append(instructions)
 
     print(f"[*] Invoking Codex Review in '{cd}'...")

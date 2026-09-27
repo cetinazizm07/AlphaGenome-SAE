@@ -18,11 +18,15 @@ except ImportError:
 from ag_sae.intervene import (
     DiscoveredFeatures,
     _CATALOG_CACHE,
+    _atomic_write_json,
     checked_element_mask,
     cleanup_gpu,
     eligible_genes,
+    is_valid_json_file,
+    map_annotation_column_to_grid,
     match_control_norm,
     select_tracks,
+    sequence_to_onehot,
 )
 
 
@@ -196,6 +200,78 @@ class TestCacheIsolationBetweenFolds(unittest.TestCase):
 
             cache_files = list(cache_dir.glob("eligible_genes_*.json"))
             self.assertEqual(len(cache_files), 2, "Different fold manifests must produce distinct cache files")
+
+
+class TestMapAnnotationColumnToGrid(unittest.TestCase):
+    def test_sparse_annotations_mapped_accurately(self):
+        window_start = 100_000
+        num_bins = 100
+        bin_bp = 128
+        bins = pd.DataFrame({
+            "bin_start": [100_000, 100_000 + 10 * 128, 100_000 + 50 * 128],
+            "cCRE_PLS": [True, False, True],
+        })
+        pos_mask, observed_mask = map_annotation_column_to_grid(bins, "cCRE_PLS", window_start, num_bins, bin_bp)
+        self.assertEqual(len(pos_mask), num_bins)
+        self.assertEqual(len(observed_mask), num_bins)
+        self.assertTrue(pos_mask[0])
+        self.assertFalse(pos_mask[10])
+        self.assertTrue(pos_mask[50])
+        self.assertEqual(pos_mask.sum(), 2)
+
+        # Observed mask should be True only at 0, 10, 50
+        self.assertEqual(observed_mask.sum(), 3)
+        self.assertTrue(observed_mask[0] and observed_mask[10] and observed_mask[50])
+
+        # Negative contrast must strictly be observed & ~pos_mask
+        neg_mask = observed_mask & ~pos_mask
+        self.assertEqual(neg_mask.sum(), 1)
+        self.assertTrue(neg_mask[10])
+        self.assertFalse(neg_mask[2])  # Unobserved positions are NOT negatives
+
+    def test_missing_column_returns_all_false(self):
+        bins = pd.DataFrame({"bin_start": [100]})
+        pos_mask, observed_mask = map_annotation_column_to_grid(bins, "non_existent", 0, 10, 128)
+        self.assertEqual(len(pos_mask), 10)
+        self.assertEqual(pos_mask.sum(), 0)
+        self.assertEqual(observed_mask.sum(), 0)
+
+
+class TestAtomicJsonAndValidation(unittest.TestCase):
+    def test_atomic_write_and_is_valid_json(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "sub" / "test.json"
+            self.assertFalse(is_valid_json_file(target))
+
+            data = {"status": "ok", "count": 42}
+            _atomic_write_json(target, data)
+
+            self.assertTrue(is_valid_json_file(target))
+            loaded = json.loads(target.read_text())
+            self.assertEqual(loaded, data)
+
+    def test_corrupt_or_empty_json_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            empty_file = Path(tmp_dir) / "empty.json"
+            empty_file.write_text("")
+            self.assertFalse(is_valid_json_file(empty_file))
+
+            corrupt_file = Path(tmp_dir) / "corrupt.json"
+            corrupt_file.write_text("{not: valid json")
+            self.assertFalse(is_valid_json_file(corrupt_file))
+
+
+class TestSequenceToOnehot(unittest.TestCase):
+    def test_encoding_shape_and_values(self):
+        seq = "ACGTN"
+        mat = sequence_to_onehot(seq)
+        self.assertEqual(mat.shape, (5, 4))
+        # ACGT row checks
+        np.testing.assert_array_equal(mat[0], [1, 0, 0, 0])  # A
+        np.testing.assert_array_equal(mat[1], [0, 1, 0, 0])  # C
+        np.testing.assert_array_equal(mat[2], [0, 0, 1, 0])  # G
+        np.testing.assert_array_equal(mat[3], [0, 0, 0, 1])  # T
+        np.testing.assert_array_equal(mat[4], [0, 0, 0, 0])  # N (unknown)
 
 
 if __name__ == "__main__":

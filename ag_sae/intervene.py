@@ -17,6 +17,7 @@ import gc
 import gzip
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -49,6 +50,74 @@ def cleanup_gpu() -> None:
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def sequence_to_onehot(sequence: str) -> np.ndarray:
+    """Convert nucleotide string to (L, 4) float32 one-hot matrix with robust multi-path fallback."""
+    try:
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot as _up_ohe
+        return _up_ohe(sequence)
+    except ImportError:
+        pass
+    try:
+        from alphagenome_pytorch.utils import sequence_to_onehot as _up_ohe
+        return _up_ohe(sequence)
+    except ImportError:
+        pass
+    # Pure NumPy fallback identical to ag_sae.extract.one_hot
+    bases = "ACGT"
+    codes = np.frombuffer(sequence.upper().encode(), dtype=np.uint8)
+    out = np.zeros((len(codes), 4), dtype=np.float32)
+    for index, base in enumerate(bases):
+        out[codes == ord(base), index] = 1.0
+    return out
+
+
+def _atomic_write_json(path: Path | str, payload: Any) -> None:
+    """Write JSON payload to disk atomically using a PID-tagged temporary file."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(target)
+
+
+def is_valid_json_file(path: Path | str | None) -> bool:
+    """Return True if path points to an existing, non-empty, parseable JSON file."""
+    if path is None:
+        return False
+    target = Path(path)
+    if not target.is_file() or target.stat().st_size == 0:
+        return False
+    try:
+        with open(target, "rb") as f:
+            json.load(f)
+        return True
+    except Exception:
+        return False
+
+
+def map_annotation_column_to_grid(
+    bins: pd.DataFrame, col: str, window_start: int, num_bins: int, bin_bp: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map an annotation column onto the dense grid, returning (pos_mask, observed_mask).
+    
+    - pos_mask: True where bin was observed and annotated as positive (True).
+    - observed_mask: True where bin was observed/present in the annotations table.
+    """
+    pos_mask = np.zeros(num_bins, dtype=bool)
+    observed_mask = np.zeros(num_bins, dtype=bool)
+    if col not in bins.columns or len(bins) == 0:
+        return pos_mask, observed_mask
+    rel_indices = ((bins.bin_start - window_start) // bin_bp).to_numpy(dtype=np.int64)
+    valid = (rel_indices >= 0) & (rel_indices < num_bins)
+    observed_indices = rel_indices[valid]
+    observed_mask[observed_indices] = True
+    col_vals = bins[col].to_numpy(bool)
+    active_indices = rel_indices[valid & col_vals]
+    pos_mask[active_indices] = True
+    return pos_mask, observed_mask
+
 
 
 
@@ -177,8 +246,6 @@ def discover_concept_features(
     max_calibration_windows: int = 10,
 ) -> DiscoveredFeatures:
     """Score SAE latents on calibration windows to find top features per concept."""
-    from alphagenome_pytorch.utils import sequence_to_onehot
-
     concepts = ["cCRE_PLS", "cCRE_CTCF_only", "cCRE_pELS", "shuffled_dELS"]
     diffs: dict[str, list[np.ndarray]] = {c: [] for c in concepts}
     scale = sae.channel_scale.float().to("cuda")
@@ -186,6 +253,7 @@ def discover_concept_features(
     with torch.no_grad():
         for window in calibration_windows[:max_calibration_windows]:
             chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
+            num_bins = (end - start) // tap.bin_bp
             seq = chrom_sequence(fasta_path, chrom)[start:end]
             onehot = sequence_to_onehot(seq).astype(np.float32)
             input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
@@ -216,30 +284,26 @@ def discover_concept_features(
                 if col not in bins.columns:
                     continue
 
-                mask = bins[col].to_numpy(bool)
-                if mask.sum() > 0 and (~mask).sum() > 0:
-                    pos = codes[mask].mean(dim=0).detach().cpu().numpy()
-                    neg = codes[~mask].mean(dim=0).detach().cpu().numpy()
+                pos_mask, observed_mask = map_annotation_column_to_grid(bins, col, start, num_bins, tap.bin_bp)
+                neg_mask = observed_mask & ~pos_mask
+                if pos_mask.sum() > 0 and neg_mask.sum() > 0:
+                    pos = codes[pos_mask].mean(dim=0).detach().cpu().numpy()
+                    neg = codes[neg_mask].mean(dim=0).detach().cpu().numpy()
                     diffs[c].append(pos - neg)
 
             del input_tensor, acts, raw, pre, codes, captured
             cleanup_gpu()
 
-    DEFAULT_FEATURES = {
-        "cCRE_PLS": 199,
-        "cCRE_CTCF_only": 4586,
-        "cCRE_pELS": 7205,
-        "shuffled_dELS": 5454,
-    }
     discovered: dict[str, int] = {}
     for c in concepts:
         if len(diffs[c]) > 0:
             avg_diff = np.mean(diffs[c], axis=0)
             discovered[c] = int(np.argmax(avg_diff))
         else:
-            default_id = DEFAULT_FEATURES.get(c, 199)
-            print(f"[Feature Discovery] No contrastive bins found for {c}; falling back to pinned feature {default_id}")
-            discovered[c] = default_id
+            raise RuntimeError(
+                f"[Feature Discovery] No contrastive bins found in calibration windows for concept '{c}'. "
+                "Cannot reliably identify latent feature without contrast."
+            )
 
     cleanup_gpu()
     return DiscoveredFeatures(
@@ -274,8 +338,6 @@ def run_triad_ablation(
     out_dir: Path,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Execute Regulatory Triad Double-Dissociation ablation across test windows."""
-    from alphagenome_pytorch.utils import sequence_to_onehot
-
     out_dir.mkdir(parents=True, exist_ok=True)
     scale = sae.channel_scale.float().to("cuda")
     forward_args = {"resolutions": (128,), "heads": ALL_HEADS, "channels_last": True}
@@ -287,21 +349,28 @@ def run_triad_ablation(
     for wi, window in enumerate(windows):
         t0 = time.time()
         chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
+        num_bins = (end - start) // tap.bin_bp
 
         bins = annotations.loc[
             (annotations.split == "test") & (annotations.chrom == chrom)
             & (annotations.bin_start >= start) & (annotations.bin_start < end)
         ].sort_values("bin_start").reset_index(drop=True)
 
+        intervention_mask = np.zeros(num_bins, dtype=bool)
         if "cCRE_any" in bins.columns:
-            intervention_mask = bins["cCRE_any"].to_numpy(bool)
-        else:
-            intervention_mask = bins["cCRE_PLS"].to_numpy(bool)
+            pos, _ = map_annotation_column_to_grid(bins, "cCRE_any", start, num_bins, tap.bin_bp)
+            intervention_mask |= pos
+        elif "cCRE_PLS" in bins.columns:
+            pos, _ = map_annotation_column_to_grid(bins, "cCRE_PLS", start, num_bins, tap.bin_bp)
+            intervention_mask |= pos
 
         if "shuffled_dELS" in bins.columns:
-            intervention_mask = intervention_mask | bins["shuffled_dELS"].to_numpy(bool)
+            pos, _ = map_annotation_column_to_grid(bins, "shuffled_dELS", start, num_bins, tap.bin_bp)
+            intervention_mask |= pos
 
         selected_bins = np.flatnonzero(intervention_mask)
+        if len(selected_bins) == 0:
+            selected_bins = np.array([num_bins // 2])
 
         seq = chrom_sequence(fasta_path, chrom)[start:end]
         onehot = sequence_to_onehot(seq).astype(np.float32)
@@ -345,12 +414,15 @@ def run_triad_ablation(
             active_mask = (codes[:, feat] > 0).cpu().numpy()
             fired_count = int(active_mask.sum())
 
-            if track_col in bins.columns:
-                elem_mask = bins[track_col].to_numpy(bool)
-            elif track_col == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
-                elem_mask = bins["cCRE_CTCF-only"].to_numpy(bool)
+            actual_col = track_col
+            if track_col not in bins.columns and track_col == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
+                actual_col = "cCRE_CTCF-only"
+
+            if actual_col in bins.columns:
+                elem_pos, _ = map_annotation_column_to_grid(bins, actual_col, start, num_bins, tap.bin_bp)
+                elem_mask = elem_pos
             else:
-                elem_mask = intervention_mask
+                elem_mask = intervention_mask.copy()
 
             ablated_codes = codes.clone()
             ablated_codes[:, feat] = 0
@@ -391,7 +463,7 @@ def run_triad_ablation(
         del input_tensor, activation, baseline_act, captured, arrays, raw, pre, codes, rebuilt
         cleanup_gpu()
 
-    (out_dir / "triad_40windows_results.json").write_text(json.dumps(window_results, indent=2))
+    _atomic_write_json(out_dir / "triad_40windows_results.json", window_results)
 
     summary_stats: dict[str, dict[str, Any]] = {}
     for cname, (feat, track_col) in target_classes.items():
@@ -418,7 +490,7 @@ def run_triad_ablation(
                     "n_measured_windows": len(deltas),
                 }
 
-    (out_dir / "regulatory_triad_summary.json").write_text(json.dumps(summary_stats, indent=2))
+    _atomic_write_json(out_dir / "regulatory_triad_summary.json", summary_stats)
     print(f"Ablation complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'regulatory_triad_summary.json'}")
     cleanup_gpu()
     return window_results, summary_stats
@@ -678,8 +750,7 @@ def eligible_genes(
     eligible.sort(key=lambda r: (r["selection_hash"], r["gene_id"]))
 
     try:
-        cache_root.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(eligible, indent=2))
+        _atomic_write_json(cache_file, eligible)
     except OSError:
         pass
 
@@ -755,8 +826,6 @@ def run_gene_injection_cohort(
     cache_dir: Path | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Execute MANE Select Gene-TSS injection across eligible protein-coding genes."""
-    from alphagenome_pytorch.utils import sequence_to_onehot
-
     out_dir.mkdir(parents=True, exist_ok=True)
     candidates = eligible_genes(gtf_path, manifest, annotations, cache_dir=cache_dir)
     n_genes = len(candidates)
@@ -838,7 +907,7 @@ def run_gene_injection_cohort(
         del input_tensor, activation, baseline, target, control, matched_control, readouts, captured
         cleanup_gpu()
 
-    (out_dir / "gene_cohort_results.json").write_text(json.dumps(gene_results, indent=2))
+    _atomic_write_json(out_dir / "gene_cohort_results.json", gene_results)
 
     measured_genes = [g for g in gene_results if g.get("status") == "measured"]
     gene_stats: dict[str, Any] = {
@@ -870,7 +939,7 @@ def run_gene_injection_cohort(
                 "fraction_target_greater_than_control": float(np.mean(np.array(diffs) > 0)),
             }
 
-    (out_dir / "gene_level_statistical_summary.json").write_text(json.dumps(gene_stats, indent=2))
+    _atomic_write_json(out_dir / "gene_level_statistical_summary.json", gene_stats)
     print(f"Gene cohort complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'gene_level_statistical_summary.json'}")
     cleanup_gpu()
     return gene_results, gene_stats
@@ -907,7 +976,23 @@ def run_single_configuration(
     manifest = pd.read_parquet(manifest_path)
     annotations = pd.read_parquet(annotations_path)
     if plan_path and plan_path.is_file():
-        windows = json.loads(plan_path.read_text())["windows"]
+        print(f"Loading planned test windows from {plan_path}...")
+        plan_data = json.loads(plan_path.read_text())
+        plan_windows = plan_data.get("windows", [])
+        # Validate planned windows against manifest test split for this fold
+        test_manifest_windows = {
+            (row.chrom, int(row.win_start), int(row.win_end))
+            for row in manifest.loc[manifest.split == "test"].itertuples()
+        }
+        valid_windows = [
+            w for w in plan_windows
+            if (w["chrom"], int(w["start"]), int(w["end"])) in test_manifest_windows
+        ]
+        if len(valid_windows) < len(plan_windows):
+            print(f"[Warning] Plan contained {len(plan_windows) - len(valid_windows)} windows not in the '{fold}' test split. Retaining {len(valid_windows)} matching test windows.")
+        if not valid_windows:
+            raise ValueError(f"None of the windows in plan {plan_path} belong to the '{fold}' test split.")
+        windows = valid_windows
     else:
         windows = [
             {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
@@ -915,23 +1000,29 @@ def run_single_configuration(
         ]
 
     # Use strictly disjoint calibration windows for feature discovery to guarantee zero data leakage
-    eval_keys = {(w["chrom"], w["start"], w["end"]) for w in windows}
+    # Calibration windows must come from non-test splits (val or train) to prevent leakage into test cohort
     calib_slice = manifest.loc[manifest.split.isin(["val", "train"])]
-    if len(calib_slice) > 0:
-        calib_candidates = [
-            {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-            for row in calib_slice.itertuples()
-            if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
-        ]
-    else:
-        calib_candidates = [
-            {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-            for row in manifest.itertuples()
-            if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
-        ]
+    if len(calib_slice) == 0:
+        raise RuntimeError(
+            "Zero data leakage policy violated: manifest contains no 'val'/'train' split windows for calibration. "
+            "Test windows cannot be used for feature discovery calibration as they overlap with the evaluation cohort."
+        )
+
+    eval_keys = {(w["chrom"], int(w["start"]), int(w["end"])) for w in windows}
+    test_keys = {
+        (row.chrom, int(row.win_start), int(row.win_end))
+        for row in manifest.loc[manifest.split == "test"].itertuples()
+    }
+    all_eval_keys = eval_keys | test_keys
+
+    calib_candidates = [
+        {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
+        for row in calib_slice.itertuples()
+        if (row.chrom, int(row.win_start), int(row.win_end)) not in all_eval_keys
+    ]
 
     if not calib_candidates:
-        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available in manifest outside evaluation windows.")
+        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available in train/val splits outside evaluation and test windows.")
     calib_windows = calib_candidates[:10]
 
     # 2. Load models
@@ -949,15 +1040,15 @@ def run_single_configuration(
 
     # 4. Regulatory Triad Ablation
     triad_summary_file = out_dir / "regulatory_triad_summary.json"
-    if triad_summary_file.is_file():
-        print(f"[Ablation] Found existing {triad_summary_file}, skipping Part 1...")
+    if is_valid_json_file(triad_summary_file):
+        print(f"[Ablation] Found valid {triad_summary_file}, skipping Part 1...")
     else:
         run_triad_ablation(sae, model, tap, windows, annotations, features, fasta_path, organism, out_dir)
 
     # 5. Gene-TSS Injection Cohort
     gene_summary_file = out_dir / "gene_level_statistical_summary.json"
-    if gene_summary_file.is_file():
-        print(f"[Injection] Found existing {gene_summary_file}, skipping Part 2...")
+    if is_valid_json_file(gene_summary_file):
+        print(f"[Injection] Found valid {gene_summary_file}, skipping Part 2...")
     else:
         run_gene_injection_cohort(
             sae=sae, model=model, tap=tap, manifest=manifest, annotations=annotations,
@@ -1005,8 +1096,9 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
     ]
     annotations = args.annotations or next((p for p in ann_candidates if p.is_file()), ann_candidates[0])
 
+    fold_plan = Path(f"/mnt/ag/analysis-code-a1f31ce/tmp/local_plan_{args.fold}.json")
     default_plan = Path("/mnt/ag/analysis-code-a1f31ce/tmp/local_plan.json")
-    plan = args.plan or (default_plan if default_plan.is_file() else None)
+    plan = args.plan or (fold_plan if fold_plan.is_file() else (default_plan if default_plan.is_file() and args.fold == "fold1" else None))
 
     run_single_configuration(
         fold=args.fold, layer=args.layer, seed=args.seed,
