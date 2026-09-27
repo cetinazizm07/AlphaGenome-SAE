@@ -39,6 +39,17 @@ TRANSCRIPTIONAL_HEADS: tuple[str, ...] = ("rna_seq", "cage", "procap")
 # In-memory RAM cache for chromosome FASTA sequences (zero-copy per run)
 CHROM_CACHE: dict[str, str] = {}
 
+# In-memory cache for track metadata catalogs and queries
+_CATALOG_CACHE: dict[str, Any] = {}
+
+
+def cleanup_gpu() -> None:
+    """Trigger Python garbage collection and empty PyTorch CUDA cache."""
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 
 def chrom_sequence(fasta_root: str | Path, chrom: str) -> str:
     """Read one chromosome sequence with RAM caching."""
@@ -175,7 +186,7 @@ def discover_concept_features(
         chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
         seq = chrom_sequence(fasta_path, chrom)[start:end]
         onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(onehot)[None].to("cuda")
+        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
 
         bins = annotations.loc[
             (annotations.split == "test") & (annotations.chrom == chrom)
@@ -191,7 +202,7 @@ def discover_concept_features(
         with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
             _ = model.predict(input_tensor, organism, resolutions=(128,), heads=("atac",), channels_last=True)
 
-        acts = torch.from_numpy(captured[0])[None].to("cuda")
+        acts = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
         raw = acts[0].float()
         pre, _ = sae.core.encode(raw / scale)
         codes = sae.core.get_sparse_activations(sae.core.activation(pre))
@@ -210,7 +221,7 @@ def discover_concept_features(
                 diffs[c].append(pos - neg)
 
         del input_tensor, acts, raw, pre, codes, captured
-        torch.cuda.empty_cache()
+        cleanup_gpu()
 
     discovered: dict[str, int] = {}
     for c in concepts:
@@ -220,6 +231,7 @@ def discover_concept_features(
         else:
             discovered[c] = 0
 
+    cleanup_gpu()
     return DiscoveredFeatures(
         promoter_feature_id=discovered.get("cCRE_PLS", 199),
         insulator_feature_id=discovered.get("cCRE_CTCF_only", 4586),
@@ -279,7 +291,7 @@ def run_triad_ablation(
 
         seq = chrom_sequence(fasta_path, chrom)[start:end]
         onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(onehot)[None].to("cuda")
+        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
 
         # 1. Capture original activation
         captured: list[np.ndarray] = []
@@ -291,7 +303,7 @@ def run_triad_ablation(
         with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
             orig_output = model.predict(input_tensor, organism, **forward_args)
 
-        activation = torch.from_numpy(captured[0])[None].to("cuda")
+        activation = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
         raw = activation[0, selected_bins].float()
         pre, params = sae.core.encode(raw / scale)
         codes = sae.core.get_sparse_activations(sae.core.activation(pre))
@@ -358,8 +370,7 @@ def run_triad_ablation(
             print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {p_atac:+.4f} | CTCF TF: {c_tf:+.4f} ({elapsed:.1f}s)", flush=True)
 
         del input_tensor, activation, baseline_act, captured, arrays, raw, pre, codes, rebuilt
-        gc.collect()
-        torch.cuda.empty_cache()
+        cleanup_gpu()
 
     (out_dir / "triad_40windows_results.json").write_text(json.dumps(window_results, indent=2))
 
@@ -373,6 +384,7 @@ def run_triad_ablation(
 
     (out_dir / "regulatory_triad_summary.json").write_text(json.dumps(summary_stats, indent=2))
     print(f"Ablation complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'regulatory_triad_summary.json'}")
+    cleanup_gpu()
     return window_results, summary_stats
 
 
@@ -440,9 +452,15 @@ def local_edit_triplet(
 
 def select_tracks(strand: str) -> dict[str, list[dict]]:
     """Select strand-matched human RNA-seq, CAGE, and PRO-cap tracks."""
-    from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+    cache_key = f"tracks_{strand}"
+    if cache_key in _CATALOG_CACHE:
+        return _CATALOG_CACHE[cache_key]
 
-    catalog = TrackMetadataCatalog.load_builtin("human")
+    if "human" not in _CATALOG_CACHE:
+        from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+        _CATALOG_CACHE["human"] = TrackMetadataCatalog.load_builtin("human")
+    catalog = _CATALOG_CACHE["human"]
+
     selected = {}
     for output_name in ("rna_seq", "cage", "procap"):
         tracks = []
@@ -460,6 +478,7 @@ def select_tracks(strand: str) -> dict[str, list[dict]]:
         if not tracks:
             raise ValueError(f"No unique tracks found for {output_name}")
         selected[output_name] = tracks
+    _CATALOG_CACHE[cache_key] = selected
     return selected
 
 
@@ -520,8 +539,48 @@ def read_selected_exons(gtf: Path, transcript_ids: set[str]) -> dict[str, list[t
     return merged
 
 
-def eligible_genes(gtf: Path, manifest: pd.DataFrame, annotations: pd.DataFrame) -> list[dict]:
-    """Select held-out MANE Select genes meeting coordinate and isolation criteria."""
+def eligible_genes(
+    gtf: Path,
+    manifest: pd.DataFrame,
+    annotations: pd.DataFrame,
+    cache_dir: Path | None = None,
+) -> list[dict]:
+    """Select held-out MANE Select genes meeting coordinate and isolation criteria.
+
+    Uses deterministic disk caching based on GTF metadata, manifest size, and
+    annotation split distribution to avoid re-parsing the large GTF file.
+    """
+    gtf_path = Path(gtf)
+    try:
+        st = gtf_path.stat()
+        gtf_info = f"{gtf_path.resolve()}:{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        gtf_info = str(gtf_path)
+
+    manifest_len = len(manifest)
+    if "split" in annotations.columns:
+        test_ann_len = len(annotations.loc[annotations.split == "test"])
+        ann_splits = str(sorted(annotations["split"].dropna().unique()))
+        ann_info = f"test_len:{test_ann_len}_splits:{ann_splits}"
+    else:
+        ann_info = f"len:{len(annotations)}"
+
+    key_str = f"gtf:{gtf_info}|manifest_len:{manifest_len}|ann:{ann_info}"
+    cache_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+
+    cache_root = Path(cache_dir) if cache_dir is not None else Path("/tmp/ag_cache")
+    cache_file = cache_root / f"eligible_genes_{cache_hash}.json"
+
+    if cache_file.is_file():
+        try:
+            cached_data = json.loads(cache_file.read_text())
+            for r in cached_data:
+                if "exons_0based_halfopen" in r:
+                    r["exons_0based_halfopen"] = [tuple(pair) for pair in r["exons_0based_halfopen"]]
+            return cached_data
+        except (json.JSONDecodeError, OSError):
+            pass
+
     WINDOW_BP = 1_048_576
     BIN_BP = 128
     EDGE_MARGIN_BP = 131_072
@@ -541,7 +600,7 @@ def eligible_genes(gtf: Path, manifest: pd.DataFrame, annotations: pd.DataFrame)
             continue
         grids[(row.chrom, start)] = {"end": end, "pls": bins.cCRE_PLS.to_numpy(bool)}
 
-    transcripts = read_mane_transcripts(gtf, {chrom for chrom, _ in grids})
+    transcripts = read_mane_transcripts(gtf_path, {chrom for chrom, _ in grids})
     preliminary = []
     for t in transcripts:
         for (chrom, win_start), grid in grids.items():
@@ -556,7 +615,7 @@ def eligible_genes(gtf: Path, manifest: pd.DataFrame, annotations: pd.DataFrame)
             preliminary.append(dict(t, window_start=win_start, window_end=grid["end"], tss_bin_index=int(tss_bin)))
             break
 
-    exons = read_selected_exons(gtf, {r["transcript_id"] for r in preliminary})
+    exons = read_selected_exons(gtf_path, {r["transcript_id"] for r in preliminary})
     eligible = []
     for r in preliminary:
         t_exons = exons.get(r["transcript_id"], [])
@@ -575,6 +634,13 @@ def eligible_genes(gtf: Path, manifest: pd.DataFrame, annotations: pd.DataFrame)
         eligible.append(r)
 
     eligible.sort(key=lambda r: (r["selection_hash"], r["gene_id"]))
+
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(eligible, indent=2))
+    except OSError:
+        pass
+
     return eligible
 
 
@@ -603,6 +669,35 @@ def summarize_gene_effects(readouts: dict[str, np.ndarray], tracks: dict) -> dic
     return summary
 
 
+def extract_transcriptional_readout(
+    output_dict: dict, head: str, indices: list[int], gene: dict
+) -> np.ndarray:
+    """Extract modality-specific transcriptional readout per track.
+
+    - PRO-cap & CAGE: 5-bin sum centered at the TSS: [tss_bin - 2, tss_bin + 2] inclusive
+    - RNA-seq: Exon-weighted average over exonic bins
+    """
+    tensor = output_dict[head][128][0] if isinstance(output_dict[head], dict) else output_dict[head][0]
+    tss_bin = int(gene["tss_bin_index"])
+
+    if head in ("procap", "cage"):
+        start_bin = max(0, tss_bin - 2)
+        end_bin = min(tensor.shape[0], tss_bin + 3)
+        return tensor[start_bin:end_bin, indices].sum(dim=0).cpu().numpy().astype(np.float32)
+    elif head == "rna_seq":
+        weights = gene.get("exon_bin_weights", [])
+        if weights and torch is not None and isinstance(tensor, torch.Tensor):
+            bin_idx = torch.tensor([w["bin_index"] for w in weights], device=tensor.device, dtype=torch.long)
+            bp_w = torch.tensor([w["exon_bp"] for w in weights], device=tensor.device, dtype=torch.float32).unsqueeze(1)
+            exon_signals = tensor[bin_idx, :][:, indices]
+            weighted_mean = (exon_signals * bp_w).sum(dim=0) / bp_w.sum()
+            return weighted_mean.cpu().numpy().astype(np.float32)
+        else:
+            return tensor[:, indices].mean(dim=0).cpu().numpy().astype(np.float32)
+    else:
+        return tensor[:, indices].mean(dim=0).cpu().numpy().astype(np.float32)
+
+
 def run_gene_injection_cohort(
     sae: Any,
     model: Any,
@@ -615,12 +710,13 @@ def run_gene_injection_cohort(
     control_feature_id: int,
     organism: torch.Tensor,
     out_dir: Path,
+    cache_dir: Path | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Execute MANE Select Gene-TSS injection across eligible protein-coding genes."""
     from alphagenome_pytorch.utils import sequence_to_onehot
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    candidates = eligible_genes(gtf_path, manifest, annotations)
+    candidates = eligible_genes(gtf_path, manifest, annotations, cache_dir=cache_dir)
     n_genes = len(candidates)
     forward_args = {"resolutions": (128,), "heads": TRANSCRIPTIONAL_HEADS, "channels_last": True}
 
@@ -642,7 +738,7 @@ def run_gene_injection_cohort(
 
         seq = chrom_sequence(fasta_path, chrom)[start:end]
         onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(onehot)[None].to("cuda")
+        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
 
         # 1. Capture original activation
         captured: list[np.ndarray] = []
@@ -654,12 +750,11 @@ def run_gene_injection_cohort(
         with torch.inference_mode(), FullStreamTower(model, tap, cap):
             orig_output = model.predict(input_tensor, organism, **forward_args)
 
-        activation = torch.from_numpy(captured[0])[None].to("cuda")
+        activation = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
         readouts: dict[str, np.ndarray] = {}
         for head in TRANSCRIPTIONAL_HEADS:
-            tensor = orig_output[head][128][0] if isinstance(orig_output[head], dict) else orig_output[head][0]
             indices = [int(t["index"]) for t in tracks[head]]
-            readouts[f"{head}_original"] = tensor[:, indices].mean(dim=0).cpu().numpy().astype(np.float32)
+            readouts[f"{head}_original"] = extract_transcriptional_readout(orig_output, head, indices, gene)
         del orig_output
 
         # 2. Local edit triplet
@@ -674,8 +769,7 @@ def run_gene_injection_cohort(
         except ValueError as err:
             gene_results.append({"rank": rank, "gene_name": gene_name, "status": "unmeasurable", "reason": str(err)})
             del input_tensor, activation, baseline, target, control, readouts, captured
-            gc.collect()
-            torch.cuda.empty_cache()
+            cleanup_gpu()
             continue
 
         # 3. Interventions forward passes
@@ -683,9 +777,8 @@ def run_gene_injection_cohort(
             with torch.inference_mode(), FullStreamTower(model, tap, run_replacement(rep)):
                 out = model.predict(input_tensor, organism, **forward_args)
             for head in TRANSCRIPTIONAL_HEADS:
-                tensor = out[head][128][0] if isinstance(out[head], dict) else out[head][0]
                 indices = [int(t["index"]) for t in tracks[head]]
-                readouts[f"{head}_{label}"] = tensor[:, indices].mean(dim=0).cpu().numpy().astype(np.float32)
+                readouts[f"{head}_{label}"] = extract_transcriptional_readout(out, head, indices, gene)
             del out
 
         effects = summarize_gene_effects(readouts, tracks)
@@ -701,8 +794,7 @@ def run_gene_injection_cohort(
             print(f"  [Gene {rank+1:02d}/{n_genes}] {gene_name:<10} | RNA Diff: {rna_d:+.4f} | PRO-cap Diff: {pro_d:+.4f} ({time.time()-tg0:.1f}s)", flush=True)
 
         del input_tensor, activation, baseline, target, control, matched_control, readouts, captured
-        gc.collect()
-        torch.cuda.empty_cache()
+        cleanup_gpu()
 
     (out_dir / "gene_cohort_results.json").write_text(json.dumps(gene_results, indent=2))
 
@@ -726,6 +818,7 @@ def run_gene_injection_cohort(
 
     (out_dir / "gene_level_statistical_summary.json").write_text(json.dumps(gene_stats, indent=2))
     print(f"Gene cohort complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'gene_level_statistical_summary.json'}")
+    cleanup_gpu()
     return gene_results, gene_stats
 
 
@@ -741,6 +834,7 @@ def run_single_configuration(
     gtf_path: Path,
     out_dir: Path,
     plan_path: Path | None = None,
+    cache_dir: Path | None = None,
 ) -> None:
     """Orchestrate evaluation for a single (fold, layer, seed) configuration."""
     from alphagenome_pytorch import AlphaGenome
@@ -796,7 +890,7 @@ def run_single_configuration(
             gtf_path=gtf_path, fasta_path=fasta_path,
             promoter_feature_id=features.promoter_feature_id,
             control_feature_id=features.insulator_feature_id,
-            organism=organism, out_dir=out_dir
+            organism=organism, out_dir=out_dir, cache_dir=cache_dir
         )
 
     print(f"\nConfiguration {fold} {layer} {seed} completed successfully in {time.time()-t_start:.1f}s!\n")
@@ -814,6 +908,7 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
     parser.add_argument("--annotations", type=Path, default=None)
     parser.add_argument("--fasta", type=Path, default=Path("/mnt/ag/data/GRCh38.primary_assembly.genome.fa"))
     parser.add_argument("--gtf", type=Path, default=Path("/mnt/ag/data/gencode.v50.basic.annotation.gtf.gz"))
+    parser.add_argument("--cache-dir", type=Path, default=None, help="Directory to cache eligible genes JSON")
     parser.add_argument("--plan", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
 
@@ -822,14 +917,28 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
     weights = args.weights or Path(f"/mnt/ag/weights/model_fold_{fold_num}.safetensors")
     sae = args.sae or Path(f"/mnt/ag/sae/{args.fold}/{args.layer}_{args.seed}/best.pt")
     out = args.out or Path(f"/mnt/ag/analysis_runs/campaign_matrix/{args.fold}_{args.layer}_{args.seed}")
-    manifest = args.manifest or Path(f"/mnt/ag/analysis-code-a1f31ce/tmp/window_manifest_fold{fold_num}.parquet")
-    annotations = args.annotations or Path(f"/mnt/ag/analysis-code-a1f31ce/tmp/annotation_matrix_fold{fold_num}.parquet")
+
+    manifest_candidates = [
+        Path(f"/mnt/ag/analysis-code-a1f31ce/manifests/window_manifest_fold{fold_num}.parquet"),
+        Path(f"/home/azizcetin/ag/manifests/window_manifest_fold{fold_num}.parquet"),
+        Path(f"/mnt/ag/manifests/window_manifest_fold{fold_num}.parquet"),
+    ]
+    manifest = args.manifest or next((p for p in manifest_candidates if p.is_file()), manifest_candidates[0])
+
+    ann_candidates = [
+        Path(f"/mnt/ag/analysis_runs/inputs/full128/{args.fold}/resid_pre_b8/annotation_main.parquet"),
+        Path(f"/mnt/ag/analysis-code-a1f31ce/tmp/annotation_matrix_fold{fold_num}.parquet"),
+    ]
+    annotations = args.annotations or next((p for p in ann_candidates if p.is_file()), ann_candidates[0])
+
+    default_plan = Path("/mnt/ag/analysis-code-a1f31ce/tmp/local_plan.json")
+    plan = args.plan or (default_plan if default_plan.is_file() else None)
 
     run_single_configuration(
         fold=args.fold, layer=args.layer, seed=args.seed,
         weights_path=weights, sae_path=sae,
         manifest_path=manifest, annotations_path=annotations,
         fasta_path=args.fasta, gtf_path=args.gtf,
-        out_dir=out, plan_path=args.plan
+        out_dir=out, plan_path=plan, cache_dir=args.cache_dir
     )
     return 0
