@@ -1,27 +1,38 @@
-"""Command dispatch. Heavy dependencies load only for the selected stage."""
+"""AlphaGenome-SAE command line interface dispatcher.
+
+Heavy dependencies load only when the requested stage is invoked.
+"""
+
+from __future__ import annotations
+
 import importlib
 import sys
 
-STAGES = {
-    "folds": ("prepare.folds", "cmd_folds"),
-    "matrix": ("prepare.annotations", "cmd_matrix"),
-    "fetch": ("prepare.sources", "cmd_fetch"),
-    "panel": ("prepare.annotations", "cmd_panel"),
-    "paper": ("paper", "cmd_paper"),
-    "extract": ("backbone", "cmd_extract"),
-    "sae": ("train", "cmd_sae"),
-    "match": ("match", "cmd_match"),
+STAGES: dict[str, tuple[str, str]] = {
+    "extract": ("extract", "main"),
+    "train": ("train", "main"),
     "intervene": ("intervene", "cmd_intervene"),
+    "campaign": ("matrix", "cmd_matrix"),
+    "matrix": ("matrix", "cmd_matrix"),
 }
 
 
-def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] in ("-h", "--help"):
-        print("Usage: python -m ag_sae <stage> [options]\nStages: " + ", ".join(STAGES))
-        return 0 if argv else 2
-    if argv[0] not in STAGES:
-        print(f"Unknown stage: {argv[0]}", file=sys.stderr)
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch command to target stage module."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: python -m ag_sae <stage> [options]\nAvailable stages: " + ", ".join(STAGES.keys()))
+        return 0 if args else 2
+    stage = args[0]
+    if stage not in STAGES:
+        print(f"Unknown stage: {stage!r}. Choose from: {', '.join(STAGES.keys())}", file=sys.stderr)
         return 2
-    module, function = STAGES[argv[0]]
-    return getattr(importlib.import_module(f"ag_sae.{module}"), function)(argv[1:])
+
+    module_name, func_name = STAGES[stage]
+    module = importlib.import_module(f"ag_sae.{module_name}")
+    func = getattr(module, func_name)
+    return int(func(args[1:]) or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
