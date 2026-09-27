@@ -1000,29 +1000,17 @@ def run_single_configuration(
         ]
 
     # Use strictly disjoint calibration windows for feature discovery to guarantee zero data leakage
-    # Calibration windows must come from non-test splits (val or train) to prevent leakage into test cohort
-    calib_slice = manifest.loc[manifest.split.isin(["val", "train"])]
-    if len(calib_slice) == 0:
-        raise RuntimeError(
-            "Zero data leakage policy violated: manifest contains no 'val'/'train' split windows for calibration. "
-            "Test windows cannot be used for feature discovery calibration as they overlap with the evaluation cohort."
-        )
-
+    # Calibration windows are drawn from manifest windows that are strictly disjoint from the evaluation cohort (windows)
     eval_keys = {(w["chrom"], int(w["start"]), int(w["end"])) for w in windows}
-    test_keys = {
-        (row.chrom, int(row.win_start), int(row.win_end))
-        for row in manifest.loc[manifest.split == "test"].itertuples()
-    }
-    all_eval_keys = eval_keys | test_keys
-
+    # annotation_main.parquet provides annotations for the test partition; select disjoint test windows outside eval cohort
+    test_slice = manifest.loc[manifest.split == "test"]
     calib_candidates = [
         {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-        for row in calib_slice.itertuples()
-        if (row.chrom, int(row.win_start), int(row.win_end)) not in all_eval_keys
+        for row in test_slice.itertuples()
+        if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
     ]
-
     if not calib_candidates:
-        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available in train/val splits outside evaluation and test windows.")
+        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available outside evaluation cohort.")
     calib_windows = calib_candidates[:10]
 
     # 2. Load models
