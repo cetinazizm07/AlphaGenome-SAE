@@ -13,6 +13,7 @@ dependencies = [
     "scipy>=1.13",
     "pyarrow>=17",
     "pandas-stubs~=3.0.5",
+    "biopython>=1.80",
 ]
 
 [project.optional-dependencies]

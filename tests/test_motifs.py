@@ -135,3 +135,72 @@ class TestMatching:
     def test_an_empty_database_is_refused(self):
         with pytest.raises(ValueError, match="Empty motif database"):
             M.match_motifs(sharp("ACGT"), {}, n_null=5)
+
+
+class TestBiopythonAndScanning:
+    def test_jaspar_records_returns_rich_objects(self, tmp_path):
+        path = tmp_path / "db.pfm"
+        path.write_text(JASPAR)
+        records = M.read_jaspar_records(path)
+        assert "CTCF" in records
+        ctcf = records["CTCF"]
+        assert ctcf.matrix_id == "MA0139.1"
+        assert ctcf.name == "CTCF"
+        assert ctcf.length == 5
+        assert isinstance(ctcf.consensus, str)
+        assert ctcf.consensus == "TGGCC"
+
+    def test_reverse_complement_motif(self, tmp_path):
+        path = tmp_path / "db.pfm"
+        path.write_text(JASPAR)
+        ctcf = M.read_jaspar_records(path)["CTCF"]
+        rc = ctcf.reverse_complement()
+        assert rc.length == ctcf.length
+        assert rc.consensus == "GGCCA"
+
+    def test_motif_from_sequences_builder(self):
+        motif = M.motif_from_sequences(["ACGT", "ACGT", "ACGA"], name="test_motif")
+        assert motif.name == "test_motif"
+        assert motif.length == 4
+        assert motif.consensus == "ACGT"
+
+    def test_motif_from_sequences_ambiguous_bases(self):
+        # Position with only ambiguous 'N' should not crash and preserve valid probabilities
+        motif = M.motif_from_sequences(["NNACGT", "NNACGT"], name="ambig_test")
+        assert motif.length == 6
+        assert (motif.pwm > 0).all()
+        assert np.isclose(motif.pwm[0], 0.25).all()
+
+
+    def test_scan_sequence_detects_forward_and_reverse_hits(self):
+        # Create a motif with known consensus TGGCC
+        jaspar_ctcf = sharp("TGGCC")
+        target_dna = "NNNNTGGCCNNNNGGCCANNNN"  # Forward hit at 4, RC hit (GGCCA) at 13
+        hits = M.scan_sequence_for_motifs(target_dna, jaspar_ctcf, min_score_ratio=0.7)
+        assert len(hits) == 2
+        assert hits[0].start == 4
+        assert hits[0].strand == "+"
+        assert hits[0].sequence == "TGGCC"
+
+        assert hits[1].start == 13
+        assert hits[1].strand == "-"
+        assert hits[1].sequence == "GGCCA"
+
+    def test_scan_handles_no_hits(self):
+        jaspar_ctcf = sharp("TGGCC")
+        target_dna = "AAAAAAAAAAAA"
+        hits = M.scan_sequence_for_motifs(target_dna, jaspar_ctcf, min_score_ratio=0.9)
+        assert hits == []
+
+
+class TestLogoVisualization:
+    def test_plot_motif_logo_creates_figure(self, tmp_path):
+        pytest.importorskip("logomaker")
+        pytest.importorskip("matplotlib")
+        pwm = sharp("TGACTCA")
+        out_png = tmp_path / "logo.png"
+        fig = M.plot_motif_logo(pwm, title="AP-1 Logo", out_path=out_png)
+        assert fig is not None
+        assert out_png.exists()
+        assert out_png.stat().st_size > 0
+
