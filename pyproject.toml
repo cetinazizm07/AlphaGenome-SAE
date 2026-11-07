@@ -20,6 +20,9 @@ dependencies = [
 figures = ["matplotlib>=3.9", "logomaker>=0.8"]
 
 torch = ["torch>=2.4"]
+# Downstream motif experiments: tangermeme (ersatz, predict, marginalize) and
+# its FIMO scanner, memelite.
+downstream = ["torch>=2.4", "tangermeme>=1.6", "memelite>=0.2"]
 dev = ["pytest>=8.0", "matplotlib>=3.9", "logomaker>=0.8"]
 
 [tool.hatch.build.targets.wheel]

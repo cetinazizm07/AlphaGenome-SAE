@@ -31,6 +31,8 @@ try:
 except ImportError:
     torch = None
 
+from ag_sae.edit import (Condition, clamp_min_feature, run_conditions, sae_edit,
+                         track_mean_profile, zero_feature)
 from ag_sae.stats import StatisticalSummary, compute_paired_statistics, safe_wilcoxon
 
 ALL_HEADS: tuple[str, ...] = (
@@ -161,8 +163,37 @@ def chrom_sequence(fasta_root: str | Path, chrom: str) -> str:
     return seq
 
 
+_FASTA_INDEX: dict[str, Any] = {}
+
+
+def window_sequence(fasta_path: str | Path, chrom: str, start: int, end: int) -> str:
+    """Upper-case sequence of [start, end), read by seeking an indexed FASTA.
+
+    An uncompressed FASTA is indexed once per process (extract.FastaIndex) and
+    each window is a seek. A gzipped FASTA cannot be seeked, so it falls back to
+    `chrom_sequence`, which scans and caches whole chromosomes.
+    """
+    path = Path(fasta_path)
+    if not path.is_file() or path.suffix == ".gz":
+        return chrom_sequence(path, chrom)[start:end]
+    from ag_sae.extract import FastaIndex
+
+    key = str(path.resolve())
+    if key not in _FASTA_INDEX:
+        _FASTA_INDEX[key] = FastaIndex(path)
+    index = _FASTA_INDEX[key]
+    name = chrom if chrom in index.records else chrom.removeprefix("chr")
+    if name not in index.records:
+        name = f"chr{chrom}"
+    return index.fetch(name, int(start), int(end)).upper()
+
+
 class FullStreamTower:
-    """Intercept and edit AlphaGenome tower residual stream before downstream paths."""
+    """Intercept and edit AlphaGenome tower residual stream before downstream paths.
+
+    Kept for the scripts under scripts/ablation. The engines now use
+    `ag_sae.edit`, which edits whole batches on the GPU.
+    """
 
     def __init__(self, model: Any, tap: Any, replace: Callable[[np.ndarray], np.ndarray]):
         if tap.kind != "tower":
@@ -246,36 +277,28 @@ def discover_concept_features(
     max_calibration_windows: int = 10,
 ) -> DiscoveredFeatures:
     """Score SAE latents on calibration windows to find top features per concept."""
+    from ag_sae.edit import capture_residual
+
     concepts = ["cCRE_PLS", "cCRE_CTCF_only", "cCRE_pELS", "shuffled_dELS"]
     diffs: dict[str, list[np.ndarray]] = {c: [] for c in concepts}
-    scale = sae.channel_scale.float().to("cuda")
+    device = sae.channel_scale.device
 
     with torch.no_grad():
         for window in calibration_windows[:max_calibration_windows]:
             chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
             num_bins = (end - start) // tap.bin_bp
-            seq = chrom_sequence(fasta_path, chrom)[start:end]
-            onehot = sequence_to_onehot(seq).astype(np.float32)
-            input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
+            seq = window_sequence(fasta_path, chrom, start, end)
+            input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
 
             bins = annotations.loc[
                 (annotations.chrom == chrom)
                 & (annotations.bin_start >= start) & (annotations.bin_start < end)
             ].sort_values("bin_start").reset_index(drop=True)
 
-            captured: list[np.ndarray] = []
-
-            def capture_fn(val):
-                captured.append(np.array(val, dtype=np.float32, copy=True))
-                return val
-
-            with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
-                _ = model.predict(input_tensor, organism, resolutions=(128,), heads=("atac",), channels_last=True)
-
-            acts = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
+            # Only the part of the model before the tap runs.
+            acts = capture_residual(model, int(tap.key), input_tensor)
             raw = acts[0].float()
-            pre, _ = sae.core.encode(raw / scale)
-            codes = sae.core.get_sparse_activations(sae.core.activation(pre))
+            codes, _ = sae.encode_codes(raw)
 
             for c in concepts:
                 col = c
@@ -291,8 +314,7 @@ def discover_concept_features(
                     neg = codes[neg_mask].mean(dim=0).detach().cpu().numpy()
                     diffs[c].append(pos - neg)
 
-            del input_tensor, acts, raw, pre, codes, captured
-            cleanup_gpu()
+            del input_tensor, acts, raw, codes
 
     discovered: dict[str, int] = {}
     for c in concepts:
@@ -336,11 +358,11 @@ def run_triad_ablation(
     fasta_path: Path,
     organism: torch.Tensor,
     out_dir: Path,
+    max_batch: int = 3,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Execute Regulatory Triad Double-Dissociation ablation across test windows."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    scale = sae.channel_scale.float().to("cuda")
-    forward_args = {"resolutions": (128,), "heads": ALL_HEADS, "channels_last": True}
+    device = sae.channel_scale.device
     target_classes = features.as_dict()
 
     window_results: list[dict] = []
@@ -372,44 +394,30 @@ def run_triad_ablation(
         if len(selected_bins) == 0:
             selected_bins = np.array([num_bins // 2])
 
-        seq = chrom_sequence(fasta_path, chrom)[start:end]
-        onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
+        seq = window_sequence(fasta_path, chrom, start, end)
+        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
 
-        # 1. Capture original activation
-        captured: list[np.ndarray] = []
-
-        def capture_fn(val):
-            captured.append(np.array(val, dtype=np.float32, copy=True))
-            return val
-
-        with torch.inference_mode(), FullStreamTower(model, tap, capture_fn):
-            orig_output = model.predict(input_tensor, organism, **forward_args)
-
-        activation = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
-        raw = activation[0, selected_bins].float()
-        pre, params = sae.core.encode(raw / scale)
-        codes = sae.core.get_sparse_activations(sae.core.activation(pre))
-
-        arrays: dict[str, np.ndarray] = {}
-        read_head_summaries(orig_output, "original", arrays)
-        del orig_output
-
-        # 2. Reconstruction pass
-        rebuilt = sae.core.decode(codes, params) * scale
-        baseline_act = activation.clone()
-        baseline_act[0, selected_bins] = rebuilt.to(activation.dtype)
-
-        with torch.inference_mode(), FullStreamTower(model, tap, run_replacement(baseline_act)):
-            recon_output = model.predict(input_tensor, organism, **forward_args)
-        read_head_summaries(recon_output, "reconstruction", arrays)
-        del recon_output
+        # Original, reconstruction and one ablation per class, batched into
+        # ceil(6 / max_batch) forwards instead of six (plus no capture pass).
+        conditions = [Condition("original"),
+                      Condition("reconstruction", 0, selected_bins, sae_edit(sae, "reconstruction"))]
+        conditions += [Condition(f"ablate_{cname}", 0, selected_bins,
+                                 sae_edit(sae, f"ablate_{cname}", zero_feature(feat)))
+                       for cname, (feat, _col) in target_classes.items()]
+        memo: dict = {}
+        profiles = run_conditions(model, int(tap.key), input_tensor, conditions,
+                                  track_mean_profile(ALL_HEADS), heads=ALL_HEADS,
+                                  max_batch=max_batch, memo=memo)
+        arrays: dict[str, np.ndarray] = {f"{head}_{label}": profile[head]
+                                         for label, profile in profiles.items()
+                                         for head in ALL_HEADS}
+        codes = memo["reconstruction"]
 
         win_data: dict[str, Any] = {
             "window_index": wi, "chrom": chrom, "start": start, "features": {}
         }
 
-        # 3. Ablate each class
+        # Effects of each class's ablation
         for cname, (feat, track_col) in target_classes.items():
             active_mask = (codes[:, feat] > 0).cpu().numpy()
             fired_count = int(active_mask.sum())
@@ -423,17 +431,6 @@ def run_triad_ablation(
                 elem_mask = elem_pos
             else:
                 elem_mask = intervention_mask.copy()
-
-            ablated_codes = codes.clone()
-            ablated_codes[:, feat] = 0
-            ablated_rebuilt = sae.core.decode(ablated_codes, params) * scale
-            ablated_act = activation.clone()
-            ablated_act[0, selected_bins] = ablated_rebuilt.to(activation.dtype)
-
-            with torch.inference_mode(), FullStreamTower(model, tap, run_replacement(ablated_act)):
-                ablate_output = model.predict(input_tensor, organism, **forward_args)
-            read_head_summaries(ablate_output, f"ablate_{cname}", arrays)
-            del ablate_output
 
             win_data["features"][cname] = {
                 "feature_id": feat, "fired_bins": fired_count, "heads": {}
@@ -460,8 +457,7 @@ def run_triad_ablation(
         if (wi + 1) % 5 == 0 or wi == 0:
             print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {p_str} | CTCF TF: {c_str} ({elapsed:.1f}s)", flush=True)
 
-        del input_tensor, activation, baseline_act, captured, arrays, raw, pre, codes, rebuilt
-        cleanup_gpu()
+        del input_tensor, arrays, codes, memo, profiles
 
     _atomic_write_json(out_dir / "triad_40windows_results.json", window_results)
 
@@ -514,6 +510,32 @@ def match_control_norm(
     matched = control.clone()
     matched[0, bin_index] = (baseline[0, bin_index].float() + control_delta * ratio).to(control.dtype)
     return matched, {"target_l2": target_norm, "control_before_l2": control_norm, "scale": ratio}
+
+
+def matched_control_edit(sae: Any, target: int, control: int, target_level: float,
+                         control_level: float):
+    """Row edit for the injection control, dose-matched to the target in L2.
+
+    Clamps `control` up to control_level, then rescales the change from the SAE
+    reconstruction to the L2 size of the change that clamping `target` up to
+    target_level makes at the same row (match_control_norm). If either change
+    is ~0 the row is left at its reconstruction and the reason is stored as
+    memo["unmeasurable"], so the caller can drop the gene.
+    """
+    def edit(rows: torch.Tensor, memo: dict) -> torch.Tensor:
+        codes, params = sae.encode_codes(rows)
+        target_codes, control_codes = codes.clone(), codes.clone()
+        target_codes[:, target] = torch.clamp_min(codes[:, target], target_level)
+        control_codes[:, control] = torch.clamp_min(codes[:, control], control_level)
+        base = sae.decode_codes(codes, params)
+        try:
+            matched, _ = match_control_norm(base[None], sae.decode_codes(target_codes, params)[None],
+                                            sae.decode_codes(control_codes, params)[None], 0)
+        except ValueError as err:
+            memo["unmeasurable"] = str(err)
+            return base
+        return matched[0]
+    return edit
 
 
 def local_edit_triplet(
@@ -783,14 +805,15 @@ def summarize_gene_effects(readouts: dict[str, np.ndarray], tracks: dict) -> dic
 
 
 def extract_transcriptional_readout(
-    output_dict: dict, head: str, indices: list[int], gene: dict
+    output_dict: dict, head: str, indices: list[int], gene: dict, batch_index: int = 0
 ) -> np.ndarray:
     """Extract modality-specific transcriptional readout per track.
 
     - PRO-cap & CAGE: 5-bin sum centered at the TSS: [tss_bin - 2, tss_bin + 2] inclusive
     - RNA-seq: Exon-weighted average over exonic bins
     """
-    tensor = output_dict[head][128][0] if isinstance(output_dict[head], dict) else output_dict[head][0]
+    value = output_dict[head][128] if isinstance(output_dict[head], dict) else output_dict[head]
+    tensor = value[batch_index]
     tss_bin = int(gene["tss_bin_index"])
 
     if head in ("procap", "cage"):
@@ -824,12 +847,13 @@ def run_gene_injection_cohort(
     organism: torch.Tensor,
     out_dir: Path,
     cache_dir: Path | None = None,
+    max_batch: int = 4,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Execute MANE Select Gene-TSS injection across eligible protein-coding genes."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    device = sae.channel_scale.device
     candidates = eligible_genes(gtf_path, manifest, annotations, cache_dir=cache_dir)
     n_genes = len(candidates)
-    forward_args = {"resolutions": (128,), "heads": TRANSCRIPTIONAL_HEADS, "channels_last": True}
 
     target_level = float(sae.core.activation(torch.tensor([5.0])).item()) if hasattr(sae.core, "activation") else 5.0
     control_level = target_level * 0.7
@@ -847,50 +871,37 @@ def run_gene_injection_cohort(
         mask = np.zeros(8192, dtype=bool)
         mask[tss_bin] = True
 
-        seq = chrom_sequence(fasta_path, chrom)[start:end]
-        onehot = sequence_to_onehot(seq).astype(np.float32)
-        input_tensor = torch.from_numpy(np.ascontiguousarray(onehot.copy()))[None].to("cuda")
+        seq = window_sequence(fasta_path, chrom, start, end)
+        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
 
-        # 1. Capture original activation
-        captured: list[np.ndarray] = []
-
-        def cap(v):
-            captured.append(np.array(v, dtype=np.float32, copy=True))
-            return v
-
-        with torch.inference_mode(), FullStreamTower(model, tap, cap):
-            orig_output = model.predict(input_tensor, organism, **forward_args)
-
-        activation = torch.from_numpy(np.ascontiguousarray(captured[0].copy()))[None].to("cuda")
-        readouts: dict[str, np.ndarray] = {}
-        for head in TRANSCRIPTIONAL_HEADS:
-            indices = [int(t["index"]) for t in tracks[head]]
-            readouts[f"{head}_original"] = extract_transcriptional_readout(orig_output, head, indices, gene)
-        del orig_output
-
-        # 2. Local edit triplet
+        # Original, reconstruction, target injection and the L2-matched control,
+        # in one batched forward (the first campaign used four, plus a capture).
         ctrl_feat = control_feature_id if control_feature_id != promoter_feature_id else (promoter_feature_id + 1)
-        baseline, target, control, _ = local_edit_triplet(
-            sae, activation, mask, promoter_feature_id, ctrl_feat, "inject",
-            target_level, control_level, 256
-        )
+        tss = [int(tss_bin)]
+        conditions = [
+            Condition("original"),
+            Condition("reconstruction", 0, tss, sae_edit(sae, "reconstruction")),
+            Condition("target", 0, tss, sae_edit(sae, "target",
+                                                 clamp_min_feature(promoter_feature_id, target_level))),
+            Condition("control", 0, tss, matched_control_edit(
+                sae, promoter_feature_id, ctrl_feat, target_level, control_level)),
+        ]
+        track_indices = {head: [int(t["index"]) for t in tracks[head]] for head in TRANSCRIPTIONAL_HEADS}
 
-        try:
-            matched_control, _ = match_control_norm(baseline, target, control, tss_bin)
-        except ValueError as err:
-            gene_results.append({"rank": rank, "gene_name": gene_name, "status": "unmeasurable", "reason": str(err)})
-            del input_tensor, activation, baseline, target, control, readouts, captured
-            cleanup_gpu()
+        def gene_readout(outputs, b, gene=gene):
+            return {head: extract_transcriptional_readout(outputs, head, track_indices[head], gene, b)
+                    for head in TRANSCRIPTIONAL_HEADS}
+
+        memo: dict = {}
+        per_condition = run_conditions(model, int(tap.key), input_tensor, conditions, gene_readout,
+                                       heads=TRANSCRIPTIONAL_HEADS, max_batch=max_batch, memo=memo)
+        if "unmeasurable" in memo:
+            gene_results.append({"rank": rank, "gene_name": gene_name, "status": "unmeasurable",
+                                 "reason": memo["unmeasurable"]})
             continue
-
-        # 3. Interventions forward passes
-        for label, rep in (("reconstruction", baseline), ("target", target), ("control", matched_control)):
-            with torch.inference_mode(), FullStreamTower(model, tap, run_replacement(rep)):
-                out = model.predict(input_tensor, organism, **forward_args)
-            for head in TRANSCRIPTIONAL_HEADS:
-                indices = [int(t["index"]) for t in tracks[head]]
-                readouts[f"{head}_{label}"] = extract_transcriptional_readout(out, head, indices, gene)
-            del out
+        readouts: dict[str, np.ndarray] = {f"{head}_{label}": values[head]
+                                           for label, values in per_condition.items()
+                                           for head in TRANSCRIPTIONAL_HEADS}
 
         effects = summarize_gene_effects(readouts, tracks)
         np.savez_compressed(out_dir / f"gene_rank_{rank:02d}_{gene_name}.npz", **readouts)
@@ -904,8 +915,7 @@ def run_gene_injection_cohort(
             pro_d = effects["procap"]["paired_difference"]
             print(f"  [Gene {rank+1:02d}/{n_genes}] {gene_name:<10} | RNA Diff: {rna_d:+.4f} | PRO-cap Diff: {pro_d:+.4f} ({time.time()-tg0:.1f}s)", flush=True)
 
-        del input_tensor, activation, baseline, target, control, matched_control, readouts, captured
-        cleanup_gpu()
+        del input_tensor, readouts, per_condition, memo
 
     _atomic_write_json(out_dir / "gene_cohort_results.json", gene_results)
 
@@ -958,6 +968,7 @@ def run_single_configuration(
     out_dir: Path,
     plan_path: Path | None = None,
     cache_dir: Path | None = None,
+    max_batch: int = 3,
 ) -> None:
     """Orchestrate evaluation for a single (fold, layer, seed) configuration."""
     from alphagenome_pytorch import AlphaGenome
@@ -1031,7 +1042,8 @@ def run_single_configuration(
     if is_valid_json_file(triad_summary_file):
         print(f"[Ablation] Found valid {triad_summary_file}, skipping Part 1...")
     else:
-        run_triad_ablation(sae, model, tap, windows, annotations, features, fasta_path, organism, out_dir)
+        run_triad_ablation(sae, model, tap, windows, annotations, features, fasta_path, organism, out_dir,
+                           max_batch=max_batch)
 
     # 5. Gene-TSS Injection Cohort
     gene_summary_file = out_dir / "gene_level_statistical_summary.json"
@@ -1043,7 +1055,7 @@ def run_single_configuration(
             gtf_path=gtf_path, fasta_path=fasta_path,
             promoter_feature_id=features.promoter_feature_id,
             control_feature_id=features.insulator_feature_id,
-            organism=organism, out_dir=out_dir, cache_dir=cache_dir
+            organism=organism, out_dir=out_dir, cache_dir=cache_dir, max_batch=max_batch
         )
 
     print(f"\nConfiguration {fold} {layer} {seed} completed successfully in {time.time()-t_start:.1f}s!\n")
@@ -1064,12 +1076,17 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", type=Path, default=None, help="Directory to cache eligible genes JSON")
     parser.add_argument("--plan", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--sae-pool", type=str, default="sae",
+                        help="SAE directory under /mnt/ag (sae, sae_k64, sae_v2, ...)")
+    parser.add_argument("--max-batch", type=int, default=3,
+                        help="conditions per forward; 3-4 on an 80 GB A100, 1-2 on 40 GB")
 
     args = parser.parse_args(argv)
     fold_num = args.fold.replace("fold", "")
     weights = args.weights or Path(f"/mnt/ag/weights/model_fold_{fold_num}.safetensors")
-    sae = args.sae or Path(f"/mnt/ag/sae/{args.fold}/{args.layer}_{args.seed}/best.pt")
-    out = args.out or Path(f"/mnt/ag/analysis_runs/campaign_matrix/{args.fold}_{args.layer}_{args.seed}")
+    sae = args.sae or Path(f"/mnt/ag/{args.sae_pool}/{args.fold}/{args.layer}_{args.seed}/best.pt")
+    campaign = "campaign_matrix" if args.sae_pool == "sae" else f"campaign_matrix_{args.sae_pool}"
+    out = args.out or Path(f"/mnt/ag/analysis_runs/{campaign}/{args.fold}_{args.layer}_{args.seed}")
 
     manifest_candidates = [
         Path(f"/mnt/ag/analysis-code-a1f31ce/manifests/window_manifest_fold{fold_num}.parquet"),
@@ -1093,7 +1110,7 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
         weights_path=weights, sae_path=sae,
         manifest_path=manifest, annotations_path=annotations,
         fasta_path=args.fasta, gtf_path=args.gtf,
-        out_dir=out, plan_path=plan, cache_dir=args.cache_dir
+        out_dir=out, plan_path=plan, cache_dir=args.cache_dir, max_batch=args.max_batch
     )
     return 0
 

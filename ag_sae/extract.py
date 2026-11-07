@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
@@ -96,7 +97,7 @@ class Capture:
     def __init__(self, model, taps: Sequence[Tap]) -> None:
         self.model = model
         self.taps = list(taps)
-        self._store: dict[str, np.ndarray] = {}
+        self._store: dict = {}
         self._handles: list = []
 
     def __enter__(self) -> "Capture":
@@ -104,12 +105,12 @@ class Capture:
         if encoder_taps:
             def on_encoder(_module, _args, output):
                 # SequenceEncoder returns (trunk, intermediates); the
-                # intermediates are NCL, so transpose to (positions, channels).
+                # intermediates are NCL, so transpose to (B, positions, channels).
                 intermediates = output[1]
                 for tap in encoder_taps:
                     if tap.key not in intermediates:
                         raise KeyError(f"encoder has no {tap.key!r}; got {sorted(intermediates)}")
-                    self._store[tap.name] = self._to_numpy(intermediates[tap.key][0].T)
+                    self._store[tap.name] = intermediates[tap.key].detach().transpose(1, 2)
             self._handles.append(self.model.encoder.register_forward_hook(on_encoder))
 
         for tap in (t for t in self.taps if t.kind == "tower"):
@@ -117,7 +118,7 @@ class Capture:
 
             def on_mha(_module, args, _kwargs, name=tap.name):
                 # args[0] is the residual stream entering the block, NLC.
-                self._store[name] = self._to_numpy(args[0][0])
+                self._store[name] = args[0].detach()
                 return None                      # do not modify the input
 
             self._handles.append(
@@ -130,18 +131,38 @@ class Capture:
         self._handles.clear()
         self._store.clear()
 
-    @staticmethod
-    def _to_numpy(tensor) -> np.ndarray:
-        return tensor.detach().float().cpu().numpy()
+    def outputs(self, item: int = 0) -> dict:
+        """One window's taps, (positions, channels), still on the model's device.
 
-    def outputs(self) -> dict[str, np.ndarray]:
+        Nothing is copied to the host here: `window_rows` moves only the rows
+        it keeps. At bin_size_4 a 1 Mb window has 262,144 positions, so copying
+        everything (as the first campaign did, in float32) moved ~1 GB per
+        window to keep 8192 rows.
+        """
         missing = [t.name for t in self.taps if t.name not in self._store]
         if missing:
             raise RuntimeError(f"hooks did not fire for {missing}")
-        return dict(self._store)
+        return {name: batch[item] for name, batch in self._store.items()}
+
+    def batch_size(self) -> int:
+        return len(next(iter(self._store.values()))) if self._store else 0
 
     def clear(self) -> None:
         self._store.clear()
+
+
+def _keep_rows(array, chosen: np.ndarray) -> np.ndarray:
+    """float16 rows `chosen` of a (positions, channels) array or device tensor.
+
+    Rounded float32 -> float16 in both paths, so a tensor gives the same bytes
+    as the old host-side `array[chosen].astype(np.float16)`.
+    """
+    if hasattr(array, "index_select"):                    # a torch tensor
+        import torch
+
+        index = torch.as_tensor(chosen, dtype=torch.long, device=array.device)
+        return array.index_select(0, index).float().half().cpu().numpy()
+    return np.asarray(array)[chosen].astype(np.float16)
 
 
 # --------------------------------------------------------------------------
@@ -169,9 +190,15 @@ def window_rows(
 ) -> dict[str, tuple[np.ndarray, pd.DataFrame]]:
     """Activations and coordinates for one window, per tap."""
     onehot = one_hot(sequence)
+    return select_rows(row, onehot, forward(onehot), taps, keep, seed)
+
+
+def select_rows(
+    row, onehot: np.ndarray, captured, taps: Sequence[Tap], keep: int, seed: int
+) -> dict[str, tuple[np.ndarray, pd.DataFrame]]:
+    """The kept positions of one window's captured taps, as float16 rows."""
     if onehot.shape[0] != row.win_end - row.win_start:
         raise ValueError(f"{row.chrom}:{row.win_start} sequence length mismatch")
-    captured = forward(onehot)
     # One RNG per window so a re-run picks the same positions. zlib.crc32 and
     # not hash(): Python randomises str hashing per process, so hash() would
     # give different positions on every run.
@@ -180,8 +207,8 @@ def window_rows(
     out = {}
     for tap in taps:
         array = captured[tap.name]
-        if array.shape != (onehot.shape[0] // tap.bin_bp, tap.channels):
-            raise ValueError(f"{tap.name}: got {array.shape}, expected "
+        if tuple(array.shape) != (onehot.shape[0] // tap.bin_bp, tap.channels):
+            raise ValueError(f"{tap.name}: got {tuple(array.shape)}, expected "
                              f"({onehot.shape[0] // tap.bin_bp}, {tap.channels})")
         chosen = choose_positions(valid_bins(onehot, tap.bin_bp), keep, rng)
         if not chosen.size:
@@ -190,7 +217,7 @@ def window_rows(
         coords = pd.DataFrame({"chrom": row.chrom, "bin_start": starts,
                                "bin_end": starts + tap.bin_bp,
                                "split": row.split, "window_start": int(row.win_start)})
-        out[tap.name] = (array[chosen].astype(np.float16), coords)
+        out[tap.name] = (_keep_rows(array, chosen), coords)
     return out
 
 
@@ -205,9 +232,16 @@ def run_extraction(
     windows_per_shard: int = 8,
     seed: int = 0,
     provenance: dict | None = None,
+    forward_many=None,
+    batch_windows: int = 1,
     log=print,
 ) -> dict:
-    """Write one shard set per tap. Resumable: finished shards are skipped."""
+    """Write one shard set per tap. Resumable: finished shards are skipped.
+
+    `forward(onehot)` captures one window. If `forward_many(list of onehots)`
+    is given, windows go through it `batch_windows` at a time instead, and it
+    returns one capture dict per window.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     identity = {
@@ -237,19 +271,24 @@ def run_extraction(
     groups = [g for _, g in manifest.groupby(
         [manifest.split, manifest.chrom,
          np.arange(len(manifest)) // windows_per_shard], sort=False)]
+    batch = max(1, int(batch_windows)) if forward_many is not None else 1
 
-    for shard_id, group in enumerate(groups):
-        if shard_id < done:
-            continue
-        buffers: dict[str, list[np.ndarray]] = {t.name: [] for t in taps}
-        coords: dict[str, list[pd.DataFrame]] = {t.name: [] for t in taps}
-        for row in group.itertuples(index=False):
-            sequence = sequence_for(row.chrom, int(row.win_start), int(row.win_end))
-            for name, (array, frame) in window_rows(
-                    row, sequence, forward, taps, positions_per_window, seed).items():
-                buffers[name].append(array)
-                coords[name].append(frame)
+    def read(group):
+        """Sequences and one-hots of a shard; runs on the reader thread."""
+        rows = list(group.itertuples(index=False))
+        onehots = [one_hot(sequence_for(r.chrom, int(r.win_start), int(r.win_end))) for r in rows]
+        return rows, onehots
 
+    def captures(onehots):
+        """Yield (window index, capture) one forward at a time, so only one
+        batch of full captures is alive on the GPU while rows are selected."""
+        for start in range(0, len(onehots), batch):
+            chunk = onehots[start:start + batch]
+            outs = forward_many(chunk) if forward_many is not None else [forward(chunk[0])]
+            yield from enumerate(outs, start)
+
+    def write(shard_id, group, buffers, coords):
+        """Save one shard and record it; runs on the writer thread, in order."""
         record = {"shard": shard_id, "split": str(group.split.iloc[0]),
                   "n_windows": int(len(group)), "taps": {}}
         for tap in taps:
@@ -271,6 +310,30 @@ def run_extraction(
         _atomic_json(index_path, index)
         log(f"shard {shard_id}/{len(groups)} split={record['split']} "
             f"rows={ {k: v['rows'] for k, v in record['taps'].items()} }")
+
+    # The GPU works on shard i while one thread reads shard i+1 and another
+    # writes shard i-1. Writes stay in shard order (one pending at a time), so
+    # index.json only ever lists complete, contiguous shards and resume works
+    # exactly as before.
+    todo = [(i, g) for i, g in enumerate(groups) if i >= done]
+    with ThreadPoolExecutor(1) as reader, ThreadPoolExecutor(1) as writer:
+        pending_read = reader.submit(read, todo[0][1]) if todo else None
+        pending_write = None
+        for n, (shard_id, group) in enumerate(todo):
+            rows, onehots = pending_read.result()
+            pending_read = reader.submit(read, todo[n + 1][1]) if n + 1 < len(todo) else None
+            buffers: dict[str, list[np.ndarray]] = {t.name: [] for t in taps}
+            coords: dict[str, list[pd.DataFrame]] = {t.name: [] for t in taps}
+            for i, captured in captures(onehots):
+                for name, (array, frame) in select_rows(
+                        rows[i], onehots[i], captured, taps, positions_per_window, seed).items():
+                    buffers[name].append(array)
+                    coords[name].append(frame)
+            if pending_write is not None:
+                pending_write.result()
+            pending_write = writer.submit(write, shard_id, group, buffers, coords)
+        if pending_write is not None:
+            pending_write.result()
 
     index["complete"] = True
     _atomic_json(index_path, index)
@@ -422,6 +485,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--float32", action="store_true",
                         help="full float32 compute; default is bfloat16 where supported")
+    parser.add_argument("--batch-windows", type=int, default=1,
+                        help="windows per forward pass; ~4 fits an 80 GB A100, 2 a 40 GB one")
     parser.add_argument("--limit-windows", type=int, default=0, help="stop after N windows, for a smoke test")
     parser.add_argument("--splits", nargs="+", help="only these splits")
     args = parser.parse_args(argv)
@@ -451,23 +516,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Hooks are installed once and the buffer cleared per window; re-registering
     # them for every forward would be pure overhead.
     with Capture(model, taps) as capture:
-        def forward(onehot: np.ndarray) -> dict[str, np.ndarray]:
+        def forward_many(onehots: list[np.ndarray]) -> list[dict]:
             capture.clear()
-            x = torch.from_numpy(onehot).unsqueeze(0).to(args.device)
+            x = torch.from_numpy(np.stack(onehots)).to(args.device, non_blocking=True)
+            organism = torch.zeros(len(onehots), dtype=torch.long, device=args.device)
             with torch.inference_mode():
-                model.encode(x, organism_index=0, resolutions=(128,))
+                model.encode(x, organism_index=organism, resolutions=(128,))
             del x
-            return capture.outputs()
+            return [capture.outputs(i) for i in range(len(onehots))]
+
+        def forward(onehot: np.ndarray) -> dict:
+            return forward_many([onehot])[0]
 
         provenance = {"weights": str(args.weights), "fasta": Path(args.fasta).name,
                       "manifest": str(args.manifest),
                       "compute": "bfloat16" if bf16 else "float32",
+                      "batch_windows": args.batch_windows,
                       "device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else args.device}
         index_json = run_extraction(
             manifest, index.fetch, forward, taps, args.out,
             positions_per_window=args.positions_per_window,
             windows_per_shard=args.windows_per_shard, seed=args.seed,
-            provenance=provenance)
+            provenance=provenance, forward_many=forward_many,
+            batch_windows=args.batch_windows)
 
     index.close()
     rows = {tap.name: sum(r["taps"].get(tap.name, {}).get("rows", 0) for r in index_json["shards"])

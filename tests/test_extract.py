@@ -277,3 +277,35 @@ class TestFastaIndex:
     def test_name_stops_at_the_first_space(self, tmp_path):
         index = E.FastaIndex(self.write(tmp_path, [("chr1", "ACGT" * 4)]))
         assert list(index.records) == ["chr1"]
+
+
+class TestPipelinedExtraction:
+    def test_batched_forward_writes_the_same_shards(self, tmp_path):
+        model, taps = FakeModel(), fake_taps()
+        manifest = tiny_manifest(n=7)
+
+        def sequences():
+            rng = np.random.default_rng(0)
+            cache = {}
+
+            def sequence_for(chrom, start, end):
+                if start not in cache:
+                    cache[start] = "".join(rng.choice(list("ACGT"), end - start))
+                return cache[start]
+            return sequence_for
+
+        def forward(onehot):
+            with E.Capture(model, taps) as capture:
+                model(onehot)
+                return {k: v.clone() for k, v in capture.outputs().items()}
+
+        def forward_many(onehots):
+            return [forward(o) for o in onehots]
+
+        single = E.run_extraction(manifest, sequences(), forward, taps, tmp_path / "a",
+                                  positions_per_window=8, windows_per_shard=3, log=lambda *a: None)
+        batched = E.run_extraction(manifest, sequences(), forward, taps, tmp_path / "b",
+                                   positions_per_window=8, windows_per_shard=3, log=lambda *a: None,
+                                   forward_many=forward_many, batch_windows=2)
+        strip = lambda shards: [{k: v for k, v in r.items()} for r in shards]
+        assert strip(single["shards"]) == strip(batched["shards"])   # same files, same hashes

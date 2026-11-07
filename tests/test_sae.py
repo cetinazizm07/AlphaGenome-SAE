@@ -135,3 +135,72 @@ class TestCheckpointContract:
             model.core.pre_bias[0] = float("nan")
         with pytest.raises(ValueError, match="non-finite"):
             S.save_inference_checkpoint(tmp_path / "bad.pt", model, S.Recipe(n_features=32))
+
+
+class TestRecipeV2:
+    def test_legacy_is_the_first_campaign(self):
+        legacy = S.Recipe.legacy()
+        assert (legacy.lr, legacy.steps, legacy.lr_schedule, legacy.init) == (1e-5, 6000, "constant", "default")
+        assert not legacy.uses_aux and legacy.seed_scope == "global" and legacy.shuffle == "shard"
+        assert legacy.learning_rate(0) == legacy.learning_rate(5999) == 1e-5
+
+    def test_warmup_then_cosine_to_the_floor(self):
+        r = S.Recipe(lr=1e-3, steps=1000, lr_warmup_steps=100, lr_final_ratio=0.1)
+        assert r.learning_rate(0) == pytest.approx(1e-5)
+        assert r.learning_rate(99) == pytest.approx(1e-3)
+        assert r.learning_rate(550) == pytest.approx(0.55e-3)
+        assert r.learning_rate(1000) == pytest.approx(1e-4)
+
+    def test_explicit_k_overrides_the_percentage(self):
+        assert S.Recipe(n_features=8192, topk=64).k(1536) == 64
+
+    def test_seeds_differ_by_tap_and_data_but_not_in_legacy(self):
+        r = S.Recipe(seed=1)
+        a = S.derive_seed(r, "resid_pre_b0", "foldA", "init")
+        assert a == S.derive_seed(r, "resid_pre_b0", "foldA", "init")
+        assert len({a, S.derive_seed(r, "resid_pre_b4", "foldA", "init"),
+                    S.derive_seed(r, "resid_pre_b0", "foldB", "init"),
+                    S.derive_seed(r, "resid_pre_b0", "foldA", "data")}) == 4
+        assert S.derive_seed(S.Recipe.legacy(seed=1), "resid_pre_b4", "x", "init") == 1
+
+
+class TestDeadLatentDefences:
+    def model(self):
+        return S.build(12, S.Recipe(n_features=48, topk=4), np.ones(12), seed=0)
+
+    def test_tied_init_has_unit_decoder_and_transposed_encoder(self):
+        m = self.model()
+        dec = m.core.decoder.weight
+        torch.testing.assert_close(dec.norm(dim=0), torch.ones(48))
+        torch.testing.assert_close(m.core.encoder.weight, dec.T)
+
+    def test_projected_gradient_keeps_columns_on_the_sphere_to_first_order(self):
+        m = self.model()
+        m.core.decoder.weight.grad = torch.randn_like(m.core.decoder.weight)
+        m.project_decoder_grad_()
+        radial = (m.core.decoder.weight.grad * m.core.decoder.weight).sum(0)
+        torch.testing.assert_close(radial, torch.zeros(48), atol=1e-5, rtol=0)
+
+    def test_aux_uses_only_dead_latents_and_is_absent_without_them(self):
+        m = self.model()
+        raw = torch.randn(10, 12)
+        *_, aux = m.forward_train(raw, torch.zeros(48, dtype=torch.bool), aux_k=8)
+        assert aux is None
+        dead = torch.zeros(48, dtype=torch.bool)
+        dead[:5] = True
+        recon, codes, scaled, aux = m.forward_train(raw, dead, aux_k=8)
+        assert aux.shape == raw.shape
+        # Only dead columns contribute: zeroing them silences aux.
+        with torch.no_grad():
+            m.core.decoder.weight[:, :5] = 0
+        *_, aux_zero = m.forward_train(raw, dead, aux_k=8)
+        torch.testing.assert_close(aux_zero, torch.zeros_like(aux_zero))
+        # The main path is the unmodified forward.
+        torch.testing.assert_close(m(raw)[0], m.forward_train(raw)[0])
+
+    def test_mean_pre_bias(self):
+        m = self.model()
+        sample = torch.randn(256, 12) * 2 + 1
+        m.init_pre_bias_(sample)
+        from ag_sae.vendor.sae_borzoi import LN
+        torch.testing.assert_close(m.core.pre_bias, LN(sample)[0].mean(0))

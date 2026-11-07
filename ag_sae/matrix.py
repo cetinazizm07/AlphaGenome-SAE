@@ -42,6 +42,8 @@ def run_matrix_campaign(
     base_out_dir: Path = Path("/mnt/ag/analysis_runs/campaign_matrix"),
     drive_remote: str = "gdrive:alphagenome_sae/campaign_matrix",
     dry_run: bool = False,
+    sae_pool: str = "sae",
+    max_batch: int = 3,
 ) -> None:
     """Execute evaluation matrix with process isolation and automatic resumption."""
     base_out_dir.mkdir(parents=True, exist_ok=True)
@@ -82,6 +84,8 @@ def run_matrix_campaign(
             "--fold", fold,
             "--layer", layer,
             "--seed", seed,
+            "--sae-pool", sae_pool,
+            "--max-batch", str(max_batch),
             "--out", str(out_dir),
         ]
 
@@ -128,20 +132,30 @@ def cmd_matrix(argv: list[str] | None = None) -> int:
     parser.add_argument("--fold", type=str, default="fold1", help="Genomic fold (fold0, fold1, fold2, fold3)")
     parser.add_argument("--layers", type=str, default="resid_pre_b8,resid_pre_b4,resid_pre_b0", help="Comma-separated layers")
     parser.add_argument("--seeds", type=str, default="seed0,seed1,seed2", help="Comma-separated seeds")
-    parser.add_argument("--out-dir", type=Path, default=Path("/mnt/ag/analysis_runs/campaign_matrix"))
-    parser.add_argument("--drive-remote", type=str, default="gdrive:alphagenome_sae/campaign_matrix")
+    parser.add_argument("--sae-pool", type=str, default="sae",
+                        help="SAE directory under /mnt/ag (sae, sae_k64, sae_v2, ...)")
+    parser.add_argument("--max-batch", type=int, default=3,
+                        help="conditions per forward; 3-4 on an 80 GB A100, 1-2 on 40 GB")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="default /mnt/ag/analysis_runs/campaign_matrix[_<pool>]")
+    parser.add_argument("--drive-remote", type=str, default=None,
+                        help="default gdrive:alphagenome_sae/campaign_matrix[_<pool>]")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
 
     args = parser.parse_args(argv)
     layers = tuple(p.strip() for p in args.layers.split(",") if p.strip())
     seeds = tuple(f"seed{p.strip().removeprefix('seed')}" for p in args.seeds.split(",") if p.strip())
+    # Matches the triad directory that motif_intervene.resolve_ctcf_feature reads.
+    name = "campaign_matrix" if args.sae_pool == "sae" else f"campaign_matrix_{args.sae_pool}"
 
     run_matrix_campaign(
         fold=args.fold,
         layers=layers,
         seeds=seeds,
-        base_out_dir=args.out_dir,
-        drive_remote=args.drive_remote,
+        base_out_dir=args.out_dir or Path(f"/mnt/ag/analysis_runs/{name}"),
+        drive_remote=args.drive_remote or f"gdrive:alphagenome_sae/{name}",
         dry_run=args.dry_run,
+        sae_pool=args.sae_pool,
+        max_batch=args.max_batch,
     )
     return 0

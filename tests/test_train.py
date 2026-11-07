@@ -149,3 +149,55 @@ class TestGuards:
     def test_gradient_accumulation_must_divide_the_batch(self, tmp_path):
         with pytest.raises(ValueError, match="multiple of microbatch"):
             recipe(batch_tokens=30, microbatch=16).validate(8)
+
+
+class TestV2Training:
+    def test_aux_path_and_dead_counter_survive_a_resume(self, tmp_path):
+        train_store, val_store = make_store(tmp_path / "cache")
+        # dead after 32 tokens = 1 step without firing, so AuxK is active.
+        settings = recipe(steps=8, eval_every=4, dead_tokens=32, aux_k=8, aux_coef=0.5, topk=1)
+        whole = T.train(train_store, val_store, settings, tmp_path / "whole",
+                        device="cpu", log=lambda *a: None)
+        T.train(train_store, val_store, settings, tmp_path / "split",
+                device="cpu", stop_after=3, log=lambda *a: None)
+        T.train(train_store, val_store, settings, tmp_path / "split", device="cpu", log=lambda *a: None)
+        a = torch.load(tmp_path / "whole/latest.pt", weights_only=False)
+        b = torch.load(tmp_path / "split/latest.pt", weights_only=False)
+        assert a["history"] == b["history"]
+        assert any(h["train_aux_mse"] > 0 for h in a["history"])
+        torch.testing.assert_close(a["since_fired"], b["since_fired"], rtol=0, atol=0)
+        for key in a["model"]:
+            torch.testing.assert_close(a["model"][key], b["model"][key], rtol=0, atol=0)
+        decoder = a["model"]["core.decoder.weight"]
+        torch.testing.assert_close(decoder.norm(dim=0), torch.ones(decoder.shape[1]))
+        assert whole["dead_latents"] >= 0
+
+    def test_legacy_recipe_reproduces_the_first_campaign_loop(self, tmp_path):
+        """Same data, seed and settings: legacy must equal the old ShardStore loop."""
+        train_store, val_store = make_store(tmp_path / "cache")
+        settings = Recipe.legacy(n_features=32, topk_pct=0.25, lr=1e-2, steps=4,
+                                 batch_tokens=32, microbatch=16, eval_every=2,
+                                 checkpoint_every=2, seed=1)
+        T.train(train_store, val_store, settings, tmp_path / "run", device="cpu",
+                precision="fp32", log=lambda *a: None)
+        got = torch.load(tmp_path / "run/latest.pt", weights_only=False)["model"]
+
+        # The first campaign's loop, written out.
+        from ag_sae.sae import channel_scale
+        scale, _ = channel_scale(train_store.batches(16), train_store.dim)
+        model = build(train_store.dim, settings, scale, "cpu")
+        opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-2,
+                               betas=(0.9, 0.999), eps=1e-8, weight_decay=0)
+        order, cursor = train_store.order(1, 0), 0
+        for _ in range(4):
+            opt.zero_grad(set_to_none=True)
+            for chunk in range(2):
+                rows = order[cursor + chunk * 16:cursor + chunk * 16 + 16]
+                recon, _, scaled = model(torch.from_numpy(train_store.take(rows)))
+                ((recon - scaled).square().sum() / (32 * train_store.dim)).backward()
+            opt.step()
+            cursor += 32
+            if cursor + 32 > len(order):
+                break
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(got[key], value, rtol=0, atol=0)

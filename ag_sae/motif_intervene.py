@@ -6,11 +6,25 @@ Implements the 2x2 Factorial Causal Mediation Protocol:
   Condition 3 (SAE Ablation): Natural sequence with target TF latent ablated (Y_W_abl)
   Condition 4 (SAE Rescue): Mutated sequence with target TF latent restored (Y_M_rescue)
 
+In every condition the anchor bin is replaced by its SAE reconstruction, so all
+contrasts are between reconstructions.
+
 Evaluates:
   - Epigenomic heads: ChIP-TF, ATAC, DNase, CAGE, PRO-cap
   - Mediation ratio: Delta_abl / Delta_ISM
   - Rescue ratio: Delta_rescue / (Y_W - Y_M)
   - Paired hypothesis testing via Wilcoxon signed-rank and Student's t-test
+
+How it runs (A100 rewrite)
+  * Motif sites are found with FIMO (memelite, tangermeme's scanner) at a
+    p-value threshold, and the ISM sequence is made with tangermeme.ersatz.
+  * Sites and ISM sequences are prepared once per fold and shared by every
+    (layer, seed) configuration, so all configurations see the same windows
+    and the same mutants.
+  * The four conditions of a window run as one batched forward through
+    `tm.FactorialMotifModel` and `tangermeme.predict` (the first campaign ran
+    six batch-1 forwards per window, two of them only to capture the stream).
+  * AlphaGenome is loaded once per fold, not once per configuration.
 """
 
 from __future__ import annotations
@@ -18,13 +32,11 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import os
 import subprocess
-import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,9 +46,9 @@ try:
 except ImportError:
     torch = None
 
-from ag_sae.extract import TAPS
-from ag_sae.motifs import JasparMotif, MotifHit, read_jaspar_records, scan_sequence_for_motifs
-from ag_sae.stats import StatisticalSummary, compute_paired_statistics, safe_wilcoxon
+from ag_sae.extract import TAPS, one_hot
+from ag_sae.motifs import JasparMotif, read_jaspar_records
+from ag_sae.stats import compute_paired_statistics
 
 DEFAULT_LAYERS: tuple[str, ...] = ("resid_pre_b8", "resid_pre_b4", "resid_pre_b0")
 DEFAULT_SEEDS: tuple[str, ...] = ("seed0", "seed1", "seed2")
@@ -67,92 +79,12 @@ CANONICAL_CTCF_COUNTS = np.array([
 
 MOTIF_HEADS: tuple[str, ...] = ("chip_tf", "atac", "dnase", "cage", "procap")
 
-CHROM_CACHE: dict[str, str] = {}
-
 
 def cleanup_gpu() -> None:
     """Trigger garbage collection and empty PyTorch CUDA cache."""
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def sequence_to_onehot(sequence: str) -> np.ndarray:
-    """Convert nucleotide string to (L, 4) float32 one-hot matrix."""
-    try:
-        from alphagenome_pytorch.utils.sequence import sequence_to_onehot as _up_ohe
-        return _up_ohe(sequence)
-    except ImportError:
-        codes = np.frombuffer(sequence.upper().encode(), dtype=np.uint8)
-        out = np.zeros((len(codes), 4), dtype=np.float32)
-        for i, b in enumerate("ACGT"):
-            out[codes == ord(b), i] = 1.0
-        return out
-
-
-def chrom_sequence(path: Path, chrom: str) -> str:
-    """Read full chromosome sequence into memory with RAM caching."""
-    if chrom in CHROM_CACHE:
-        return CHROM_CACHE[chrom]
-    import gzip
-    opener = gzip.open if Path(path).suffix == ".gz" else open
-    chunks: list[str] = []
-    active = False
-    with opener(path, "rt") as stream:
-        for line in stream:
-            if line.startswith(">"):
-                header_chrom = line[1:].strip().split()[0]
-                if header_chrom == chrom or header_chrom == chrom.removeprefix("chr"):
-                    active = True
-                elif active:
-                    break
-            elif active:
-                chunks.append(line.strip())
-
-    seq = "".join(chunks).upper()
-    CHROM_CACHE[chrom] = seq
-    return seq
-
-
-class FullStreamTower:
-    """Intercept and edit AlphaGenome tower residual stream before downstream paths."""
-
-    def __init__(self, model: Any, tap: Any, replace: Callable[[np.ndarray | torch.Tensor], np.ndarray | torch.Tensor]):
-        if tap.kind != "tower":
-            raise ValueError("Intervention requires a tower tap")
-        self.tower = model.tower
-        self.block = self.tower.blocks[int(tap.key)]
-        self.replace = replace
-        self.previous = None
-
-    def __enter__(self) -> "FullStreamTower":
-        self.previous = self.tower._forward_block
-
-        def on_block(block, x, pair_x, compute_dtype):
-            if block is self.block:
-                current = x[0].detach().float().cpu().numpy()
-                edited = self.replace(current)
-                if isinstance(edited, torch.Tensor):
-                    replacement = x.clone()
-                    replacement[0] = edited.to(device=x.device, dtype=x.dtype)
-                    return self.previous(block, replacement, pair_x, compute_dtype)
-                edited = np.asarray(edited, dtype=np.float32)
-                if edited.shape != current.shape or not np.isfinite(edited).all():
-                    raise ValueError("Editor produced invalid shape or non-finite values")
-                replacement = x.clone()
-                replacement[0] = torch.as_tensor(
-                    np.ascontiguousarray(edited), dtype=x.dtype, device=x.device
-                )
-                return self.previous(block, replacement, pair_x, compute_dtype)
-            return self.previous(block, x, pair_x, compute_dtype)
-
-        self.tower._forward_block = on_block
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        if self.previous is not None:
-            self.tower._forward_block = self.previous
-
 
 
 def is_valid_json_file(path: Path | str | None) -> bool:
@@ -181,7 +113,6 @@ def is_valid_motif_summary(path: Path | str | None, min_windows: int = 5) -> boo
         return False
 
 
-
 def get_canonical_ctcf_motif(jaspar_file: Path | None = None) -> JasparMotif:
     """Load canonical CTCF JasparMotif object from file or built-in matrix."""
     if jaspar_file and jaspar_file.is_file():
@@ -189,8 +120,7 @@ def get_canonical_ctcf_motif(jaspar_file: Path | None = None) -> JasparMotif:
             records = read_jaspar_records(jaspar_file)
             if "CTCF" in records:
                 return records["CTCF"]
-            # Look for MA0139 or any CTCF accession
-            for k, m in records.items():
+            for m in records.values():
                 if "CTCF" in m.name.upper() or "MA0139" in m.matrix_id:
                     return m
         except Exception:
@@ -198,470 +128,419 @@ def get_canonical_ctcf_motif(jaspar_file: Path | None = None) -> JasparMotif:
     return JasparMotif(matrix_id="MA0139.1", name="CTCF", counts=CANONICAL_CTCF_COUNTS)
 
 
-def mutate_motif_anchor(seq: str, hit: MotifHit, rng: np.random.Generator) -> str:
-    """Generate in silico mutagenesis (ISM) sequence by shuffling the motif core."""
-    motif_chars = list(hit.sequence)
-    # Permute until different from wild-type sequence
-    shuffled = "".join(rng.permutation(motif_chars))
-    attempts = 0
-    while shuffled == hit.sequence and attempts < 10:
-        shuffled = "".join(rng.permutation(motif_chars))
-        attempts += 1
-    return seq[:hit.start] + shuffled + seq[hit.end:]
+def _atomic_json(path: Path, payload: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
 
 
-def extract_head_tensor(val: Any) -> torch.Tensor:
-    """Extract tensor from model head prediction (dict[int, Tensor] or Tensor)."""
-    if isinstance(val, dict) and 128 in val:
-        return val[128]
-    elif isinstance(val, torch.Tensor):
-        return val
-    raise ValueError(f"Unexpected prediction output format: {type(val)}")
+# --------------------------------------------------------------------------
+# Sites and mutants, shared by every configuration of a fold
+# --------------------------------------------------------------------------
 
 
+@dataclass
+class MotifWindow:
+    """One measured window: its strongest motif site and the ISM sequence."""
 
-def run_motif_causal_cohort(
+    chrom: str
+    start: int
+    end: int
+    site_start: int          # window-relative, like the first campaign's hit.start
+    site_end: int
+    strand: str
+    score: float
+    p_value: float
+    site_sequence: str
+    wt: Any                  # (1, 4, L) float32 one-hot, tangermeme layout
+    mut: Any
+
+    def anchor_bin(self, bin_bp: int) -> int:
+        return self.site_start // bin_bp
+
+    def record(self) -> dict:
+        out = asdict(self)
+        out.pop("wt"), out.pop("mut")
+        return out
+
+
+def prepare_motif_windows(
+    windows: Sequence[dict],
+    fasta_path: Path,
+    motif: JasparMotif,
+    *,
+    n_windows: int = 25,
+    p_threshold: float = 1e-5,
+    seed: int = 42,
+    shuffle_method: str = "shuffle",
+    log=print,
+) -> list[MotifWindow]:
+    """Strongest FIMO site per window, in manifest order, until `n_windows`.
+
+    The ISM sequence shuffles the site with tangermeme.ersatz; each window's
+    shuffle has its own seed (seed + its rank) so the mutants do not depend on
+    which configuration is being measured.
+    """
+    from ag_sae.intervene import window_sequence
+    from ag_sae.tm import shuffle_site, strongest_sites, to_tangermeme
+
+    out: list[MotifWindow] = []
+    for window in windows:
+        if len(out) >= n_windows:
+            break
+        chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
+        sequence = window_sequence(fasta_path, chrom, start, end)
+        x = to_tangermeme(one_hot(sequence))
+        hits = strongest_sites(x, motif, name=motif.name, threshold=p_threshold)
+        if hits.empty:
+            continue
+        hit = hits.iloc[0]
+        s, e = int(hit["start"]), int(hit["end"])
+        mut = shuffle_site(x, s, e, seed=seed + len(out), method=shuffle_method)
+        out.append(MotifWindow(chrom, start, end, s, e, str(hit["strand"]),
+                               float(hit["score"]), float(hit["p-value"]),
+                               sequence[s:e], x, mut))
+    log(f"prepared {len(out)} {motif.name} windows (FIMO p<{p_threshold:g}, "
+        f"ISM={shuffle_method}) from {len(windows)} candidates")
+    return out
+
+
+# --------------------------------------------------------------------------
+# The 2x2 measurement
+# --------------------------------------------------------------------------
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    return float(np.clip(numerator / denominator, -2.0, 2.0)) if abs(denominator) > 1e-4 else 0.0
+
+
+def measure_motif_windows(
     sae: Any,
     model: Any,
     tap: Any,
-    windows: list[dict],
-    fasta_path: Path,
-    organism: torch.Tensor,
+    motif_windows: Sequence[MotifWindow],
     target_feature_id: int,
-    motif: JasparMotif,
-    out_dir: Path,
-    min_score_ratio: float = 0.5,
-    max_measured_windows: int = 25,
-    seed: int = 42,
-) -> dict[str, Any]:
-    """Execute 2x2 factorial causal mediation protocol across genomic windows."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(seed)
-    scale = sae.channel_scale.float().to("cuda")
-    forward_args = {"resolutions": (128,), "heads": MOTIF_HEADS, "channels_last": True}
+    *,
+    heads: Sequence[str] = MOTIF_HEADS,
+    max_batch: int = 4,
+    device: str = "cuda",
+) -> list[dict]:
+    """Per-window metrics for one SAE, in the first campaign's JSON schema."""
+    from tangermeme.predict import predict
+    from ag_sae.tm import FactorialMotifModel
 
-    window_results: list[dict] = []
-    measured_count = 0
-    t_start = time.time()
+    if not motif_windows:
+        return []
+    wrapper = FactorialMotifModel(model, sae, int(tap.key), target_feature_id, heads,
+                                  max_batch=max_batch)
+    x_wt = torch.cat([w.wt for w in motif_windows])
+    x_mut = torch.cat([w.mut for w in motif_windows])
+    anchors = torch.tensor([float(w.anchor_bin(tap.bin_bp)) for w in motif_windows])
+    # dtype pinned: tangermeme casts every argument to it, and anchor bins
+    # above 256 would round in bf16.
+    readouts, latents = predict(wrapper, x_wt, args=(x_mut, anchors), batch_size=1,
+                                dtype=torch.float32, device=device)
+    readouts, latents = readouts.double().numpy(), latents.double().numpy()
 
-    print(f"Scanning up to {len(windows)} windows for canonical {motif.name} ({motif.matrix_id}) anchors...")
-
-    for wi, window in enumerate(windows):
-        if measured_count >= max_measured_windows:
-            break
-
-        chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
-        seq = chrom_sequence(fasta_path, chrom)[start:end]
-
-        # 1. Scan sequence for motif hits
-        hits = scan_sequence_for_motifs(seq, motif, min_score_ratio=min_score_ratio)
-        if not hits:
-            continue
-
-        # Select highest-scoring motif hit
-        hit = max(hits, key=lambda h: h.score)
-        anchor_bin = hit.start // tap.bin_bp
-
-        # Boundary check
-        if anchor_bin >= 8192:
-            continue
-
-        # 2. Mutate DNA at motif anchor (In Silico Mutagenesis)
-        mut_seq = mutate_motif_anchor(seq, hit, rng)
-
-        wt_onehot = sequence_to_onehot(seq).astype(np.float32)
-        mut_onehot = sequence_to_onehot(mut_seq).astype(np.float32)
-
-        wt_tensor = torch.from_numpy(np.ascontiguousarray(wt_onehot[None])).to("cuda")
-        mut_tensor = torch.from_numpy(np.ascontiguousarray(mut_onehot[None])).to("cuda")
-
-        # ------------------------------------------------------------------
-        # Condition 1: Wild-Type (WT) baseline reconstruction
-        # ------------------------------------------------------------------
-        captured_wt: list[np.ndarray] = []
-
-        def cap_wt(v):
-            captured_wt.append(np.array(v, dtype=np.float32, copy=True))
-            return v
-
-        with torch.inference_mode(), FullStreamTower(model, tap, cap_wt):
-            _ = model.predict(wt_tensor, organism, **forward_args)
-
-        raw_wt = torch.from_numpy(np.ascontiguousarray(captured_wt[0]))[None].to("cuda")
-        pos_tensor = torch.tensor([anchor_bin], dtype=torch.long, device="cuda")
-        raw_anchor = raw_wt[0, pos_tensor].float()
-        pre_wt, params_wt = sae.core.encode(raw_anchor / scale)
-        wt_codes = sae.core.get_sparse_activations(sae.core.activation(pre_wt))
-        rebuilt_wt = (sae.core.decode(wt_codes, params_wt) * scale).to(raw_wt.dtype)
-
-        wt_act = raw_wt.clone()
-        wt_act[0, pos_tensor] = rebuilt_wt
-
-        with torch.inference_mode(), FullStreamTower(model, tap, lambda _: wt_act[0]):
-            out_wt = model.predict(wt_tensor, organism, **forward_args)
-
-        # ------------------------------------------------------------------
-        # Condition 2: In Silico Mutagenesis (ISM) on motif
-        # ------------------------------------------------------------------
-        captured_mut: list[np.ndarray] = []
-
-        def cap_mut(v):
-            captured_mut.append(np.array(v, dtype=np.float32, copy=True))
-            return v
-
-        with torch.inference_mode(), FullStreamTower(model, tap, cap_mut):
-            _ = model.predict(mut_tensor, organism, **forward_args)
-
-        raw_mut = torch.from_numpy(np.ascontiguousarray(captured_mut[0]))[None].to("cuda")
-        raw_mut_anchor = raw_mut[0, pos_tensor].float()
-        pre_mut, params_mut = sae.core.encode(raw_mut_anchor / scale)
-        mut_codes = sae.core.get_sparse_activations(sae.core.activation(pre_mut))
-        rebuilt_mut = (sae.core.decode(mut_codes, params_mut) * scale).to(raw_mut.dtype)
-
-        mut_act = raw_mut.clone()
-        mut_act[0, pos_tensor] = rebuilt_mut
-
-        with torch.inference_mode(), FullStreamTower(model, tap, lambda _: mut_act[0]):
-            out_ism = model.predict(mut_tensor, organism, **forward_args)
-
-        # ------------------------------------------------------------------
-        # Condition 3: SAE Latent Ablation on WT sequence
-        # ------------------------------------------------------------------
-        abl_codes = wt_codes.clone()
-        abl_codes[:, target_feature_id] = 0.0
-        rebuilt_abl = (sae.core.decode(abl_codes, params_wt) * scale).to(raw_wt.dtype)
-
-        abl_act = raw_wt.clone()
-        abl_act[0, pos_tensor] = rebuilt_abl
-
-        with torch.inference_mode(), FullStreamTower(model, tap, lambda _: abl_act[0]):
-            out_abl = model.predict(wt_tensor, organism, **forward_args)
-
-        # ------------------------------------------------------------------
-        # Condition 4: SAE Latent Rescue on Mutant sequence
-        # ------------------------------------------------------------------
-        # Clamp/restore the target feature in mutant to its WT firing level
-        rescue_codes = mut_codes.clone()
-        rescue_codes[:, target_feature_id] = wt_codes[:, target_feature_id]
-        rebuilt_rescue = (sae.core.decode(rescue_codes, params_mut) * scale).to(raw_mut.dtype)
-
-        rescue_act = raw_mut.clone()
-        rescue_act[0, pos_tensor] = rebuilt_rescue
-
-        with torch.inference_mode(), FullStreamTower(model, tap, lambda _: rescue_act[0]):
-            out_rescue = model.predict(mut_tensor, organism, **forward_args)
-
-        # ------------------------------------------------------------------
-        # Extract Readouts across heads at the anchor bin neighborhood
-        # ------------------------------------------------------------------
-        eval_window_bins = slice(max(0, anchor_bin - 1), min(8192, anchor_bin + 2))
-        win_metrics: dict[str, Any] = {
-            "chrom": chrom,
-            "start": start,
-            "end": end,
-            "anchor_start": hit.start,
-            "anchor_end": hit.end,
-            "anchor_strand": hit.strand,
-            "anchor_score": hit.score,
-            "anchor_seq": hit.sequence,
-            "anchor_bin": anchor_bin,
-            "wt_latent_val": float(wt_codes[0, target_feature_id].item()),
-            "mut_latent_val": float(mut_codes[0, target_feature_id].item()),
-            "heads": {},
-        }
-
-        for head in MOTIF_HEADS:
-            t_wt = extract_head_tensor(out_wt[head])
-            t_ism = extract_head_tensor(out_ism[head])
-            t_abl = extract_head_tensor(out_abl[head])
-            t_rescue = extract_head_tensor(out_rescue[head])
-
-            y_wt = t_wt[0, eval_window_bins].mean().item()
-            y_ism = t_ism[0, eval_window_bins].mean().item()
-            y_abl = t_abl[0, eval_window_bins].mean().item()
-            y_rescue = t_rescue[0, eval_window_bins].mean().item()
-
-            delta_ism = y_ism - y_wt
-            delta_abl = y_abl - y_wt
-            delta_rescue = y_rescue - y_ism
-
-            # Causal Mediation & Rescue Ratios
-            mediation = (delta_abl / delta_ism) if abs(delta_ism) > 1e-4 else 0.0
-            rescue_rate = (delta_rescue / (y_wt - y_ism)) if abs(y_wt - y_ism) > 1e-4 else 0.0
-
-            win_metrics["heads"][head] = {
-                "y_wt": y_wt,
-                "y_ism": y_ism,
-                "y_abl": y_abl,
-                "y_rescue": y_rescue,
-                "delta_ism": delta_ism,
-                "delta_abl": delta_abl,
-                "delta_rescue": delta_rescue,
-                "mediation_ratio": float(np.clip(mediation, -2.0, 2.0)),
-                "rescue_ratio": float(np.clip(rescue_rate, -2.0, 2.0)),
+    results = []
+    for i, window in enumerate(motif_windows):
+        record = {"chrom": window.chrom, "start": window.start, "end": window.end,
+                  "anchor_start": window.site_start, "anchor_end": window.site_end,
+                  "anchor_strand": window.strand, "anchor_score": window.score,
+                  "anchor_pvalue": window.p_value, "anchor_seq": window.site_sequence,
+                  "anchor_bin": window.anchor_bin(tap.bin_bp),
+                  "wt_latent_val": float(latents[i, 0]),
+                  "mut_latent_val": float(latents[i, 1]), "heads": {}}
+        for h, head in enumerate(heads):
+            y_wt, y_ism, y_abl, y_rescue = (float(v) for v in readouts[i, :, h])
+            record["heads"][head] = {
+                "y_wt": y_wt, "y_ism": y_ism, "y_abl": y_abl, "y_rescue": y_rescue,
+                "delta_ism": y_ism - y_wt, "delta_abl": y_abl - y_wt,
+                "delta_rescue": y_rescue - y_ism,
+                "mediation_ratio": _ratio(y_abl - y_wt, y_ism - y_wt),
+                "rescue_ratio": _ratio(y_rescue - y_ism, y_wt - y_ism),
             }
+        results.append(record)
+    return results
 
-        window_results.append(win_metrics)
-        measured_count += 1
 
-        tf_delta_ism = win_metrics["heads"]["chip_tf"]["delta_ism"]
-        tf_delta_abl = win_metrics["heads"]["chip_tf"]["delta_abl"]
-        tf_med = win_metrics["heads"]["chip_tf"]["mediation_ratio"]
-        print(f"  [Motif {measured_count:02d}/{max_measured_windows}] {chrom}:{hit.start} ({hit.strand}) | "
-              f"ChIP-TF ISM: {tf_delta_ism:+.3f} | Abl: {tf_delta_abl:+.3f} | Mediation: {tf_med*100:.1f}%", flush=True)
+def summarize_motif_windows(window_results: list[dict], motif: JasparMotif,
+                            feature_id: int, heads: Sequence[str] = MOTIF_HEADS) -> dict:
+    """Aggregate statistics; same keys as the first campaign, plus ratio-of-means.
 
-        del wt_tensor, mut_tensor, raw_wt, raw_mut, wt_act, mut_act, abl_act, rescue_act
-        del out_wt, out_ism, out_abl, out_rescue
-        cleanup_gpu()
+    The per-window ratios are clipped to [-2, 2] and set to 0 when the ISM
+    effect is tiny, which biases their mean towards 0. The ratio of the mean
+    deltas (`mediation_ratio_of_means`) has neither problem and is the one to
+    report as "the share of the motif's effect that goes through the feature".
+    """
+    summary: dict[str, Any] = {"motif_id": motif.matrix_id, "motif_name": motif.name,
+                               "feature_id": feature_id,
+                               "n_measured_windows": len(window_results), "heads": {}}
+    for head in heads:
+        def column(key: str) -> np.ndarray:
+            return np.array([w["heads"][head][key] for w in window_results], dtype=np.float64)
 
-    # Save detailed per-window records
-    detail_file = out_dir / "motif_per_window_results.json"
-    detail_file.write_text(json.dumps(window_results, indent=2))
+        ism, abl, rescue = column("delta_ism"), column("delta_abl"), column("delta_rescue")
+        mediation, rescue_ratio = column("mediation_ratio"), column("rescue_ratio")
+        usable = len(ism) > 0 and abs(ism.mean()) > 1e-12
+        summary["heads"][head] = {
+            "ism_stats": compute_paired_statistics(ism).to_dict() if len(ism) >= 2 else {},
+            "abl_stats": compute_paired_statistics(abl).to_dict() if len(abl) >= 2 else {},
+            "rescue_stats": compute_paired_statistics(rescue).to_dict() if len(rescue) >= 2 else {},
+            "mean_mediation_ratio": float(mediation.mean()) if len(mediation) else 0.0,
+            "median_mediation_ratio": float(np.median(mediation)) if len(mediation) else 0.0,
+            "mean_rescue_ratio": float(rescue_ratio.mean()) if len(rescue_ratio) else 0.0,
+            "median_rescue_ratio": float(np.median(rescue_ratio)) if len(rescue_ratio) else 0.0,
+            "mediation_ratio_of_means": float(abl.mean() / ism.mean()) if usable else None,
+            "rescue_ratio_of_means": float(rescue.mean() / -ism.mean()) if usable else None,
+        }
+    return summary
 
-    # ----------------------------------------------------------------------
-    # Aggregate Statistical Summaries across Measured Windows
-    # ----------------------------------------------------------------------
-    summary_stats: dict[str, Any] = {
-        "motif_id": motif.matrix_id,
-        "motif_name": motif.name,
-        "feature_id": target_feature_id,
-        "n_measured_windows": len(window_results),
-        "heads": {},
+
+def run_motif_causal_cohort(sae, model, tap, motif_windows, motif, target_feature_id,
+                            out_dir: Path, *, max_batch: int = 4, device: str = "cuda") -> dict:
+    """Measure one configuration and write its two JSON files."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t_start = time.time()
+    results = measure_motif_windows(sae, model, tap, motif_windows, target_feature_id,
+                                    max_batch=max_batch, device=device)
+    for n, record in enumerate(results, 1):
+        tf = record["heads"]["chip_tf"]
+        print(f"  [Motif {n:02d}/{len(results)}] {record['chrom']}:{record['start'] + record['anchor_start']} "
+              f"({record['anchor_strand']}) | ChIP-TF ISM: {tf['delta_ism']:+.3f} | "
+              f"Abl: {tf['delta_abl']:+.3f} | Mediation: {tf['mediation_ratio'] * 100:.1f}%")
+    _atomic_json(out_dir / "motif_per_window_results.json", results)
+    summary = summarize_motif_windows(results, motif, target_feature_id)
+    _atomic_json(out_dir / "motif_causal_summary.json", summary)
+    print(f"Motif cohort done in {time.time() - t_start:.1f}s -> {out_dir / 'motif_causal_summary.json'}")
+    return summary
+
+
+# --------------------------------------------------------------------------
+# Paths, feature choice, and the fold/campaign drivers
+# --------------------------------------------------------------------------
+
+
+def _first(paths: Sequence[Path]) -> Path:
+    return next((p for p in paths if p.exists()), paths[0])
+
+
+def resolve_fold_paths(base_dir: Path, fold: str) -> dict[str, Path]:
+    n = fold.replace("fold", "")
+    return {
+        "manifest": _first([base_dir / "analysis-code-a1f31ce" / "manifests" / f"window_manifest_fold{n}.parquet",
+                            Path.home() / "ag" / "manifests" / f"window_manifest_fold{n}.parquet",
+                            base_dir / "inputs" / f"manifest_{fold}.parquet"]),
+        "fasta": _first([base_dir / "data" / "GRCh38.primary_assembly.genome.fa",
+                         base_dir / "inputs" / "genome.fa"]),
+        "weights": _first([base_dir / "weights" / f"model_fold_{n}.safetensors",
+                           base_dir / "weights" / fold]),
+        "jaspar": _first([base_dir / "data" / "jaspar" / "JASPAR2024_CORE_vertebrates_non-redundant_pfms_jaspar.txt",
+                          Path("data/jaspar/JASPAR2024_CORE_vertebrates_non-redundant_pfms_jaspar.txt")]),
     }
 
-    for head in MOTIF_HEADS:
-        delta_ism_arr = np.array([w["heads"][head]["delta_ism"] for w in window_results], dtype=np.float64)
-        delta_abl_arr = np.array([w["heads"][head]["delta_abl"] for w in window_results], dtype=np.float64)
-        delta_rescue_arr = np.array([w["heads"][head]["delta_rescue"] for w in window_results], dtype=np.float64)
-        mediation_arr = np.array([w["heads"][head]["mediation_ratio"] for w in window_results], dtype=np.float64)
-        rescue_arr = np.array([w["heads"][head]["rescue_ratio"] for w in window_results], dtype=np.float64)
 
-        summary_stats["heads"][head] = {
-            "ism_stats": compute_paired_statistics(delta_ism_arr).to_dict() if len(delta_ism_arr) >= 2 else {},
-            "abl_stats": compute_paired_statistics(delta_abl_arr).to_dict() if len(delta_abl_arr) >= 2 else {},
-            "rescue_stats": compute_paired_statistics(delta_rescue_arr).to_dict() if len(delta_rescue_arr) >= 2 else {},
-            "mean_mediation_ratio": float(np.mean(mediation_arr)) if len(mediation_arr) else 0.0,
-            "median_mediation_ratio": float(np.median(mediation_arr)) if len(mediation_arr) else 0.0,
-            "mean_rescue_ratio": float(np.mean(rescue_arr)) if len(rescue_arr) else 0.0,
-            "median_rescue_ratio": float(np.median(rescue_arr)) if len(rescue_arr) else 0.0,
-        }
-
-    summary_file = out_dir / "motif_causal_summary.json"
-    summary_file.write_text(json.dumps(summary_stats, indent=2))
-    print(f"\nMotif causal cohort completed in {time.time()-t_start:.1f}s. Results written to {summary_file}.")
-    return summary_stats
+def resolve_sae_path(base_dir: Path, sae_pool: str, fold: str, layer: str, seed: str) -> Path:
+    return _first([base_dir / sae_pool / fold / f"{layer}_{seed}" / "best.pt",
+                   base_dir / sae_pool / fold / layer / seed / "checkpoints" / "best.pt",
+                   base_dir / sae_pool / fold / layer / seed / "best.pt"])
 
 
-def run_motif_configuration(
+def resolve_ctcf_feature(sae, model, tap, *, base_dir: Path, fold: str, layer: str,
+                         config_name: str, sae_pool: str, manifest: pd.DataFrame,
+                         fasta_path: Path, triad_dir: Path | None = None,
+                         feature: int | None = None) -> tuple[int, str]:
+    """The CTCF feature to test and where it came from.
+
+    Order: an explicit --feature; the triad campaign's summary for this
+    configuration; discovery on calibration windows. Unlike the first campaign
+    there is no hard-coded fallback: a feature picked for another fold and
+    layer would make the run meaningless, so failure stops the configuration.
+    """
+    if feature is not None:
+        return int(feature), "explicit"
+    if triad_dir is None:
+        name = "campaign_matrix" if sae_pool == "sae" else f"campaign_matrix_{sae_pool}"
+        triad_dir = base_dir / "analysis_runs" / name / config_name
+    triad_file = triad_dir / "regulatory_triad_summary.json"
+    if triad_file.is_file():
+        data = json.loads(triad_file.read_text())
+        return int(data["CTCF_Insulator"]["feature_id"]), str(triad_file)
+
+    annotations_path = next((p for p in [
+        base_dir / "analysis_runs" / "inputs" / "full128" / fold / layer / "annotation_main.parquet",
+        base_dir / "inputs" / f"annotations_{fold}.parquet"] if p.is_file()), None)
+    if annotations_path is None:
+        raise FileNotFoundError(f"{config_name}: no triad summary and no annotations to discover "
+                                "the CTCF feature; pass --feature")
+    from ag_sae.intervene import discover_concept_features
+
+    calibration = manifest.loc[manifest.split == "calibration"]
+    if calibration.empty:
+        calibration = manifest.loc[manifest.split == "test"].iloc[:10]
+    windows = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
+               for r in calibration.itertuples()]
+    found = discover_concept_features(sae=sae, model=model, tap=tap, calibration_windows=windows,
+                                      annotations=pd.read_parquet(annotations_path),
+                                      fasta_path=fasta_path, organism=torch.tensor([0], device="cuda"),
+                                      max_calibration_windows=10)
+    return int(found.insulator_feature_id), f"discovered:{annotations_path}"
+
+
+def matrix_subdir(sae_pool: str) -> str:
+    """Output folder of a pool: motif_matrix, motif_matrix_k64, motif_matrix_<pool>."""
+    return "motif_matrix" if sae_pool == "sae" else f"motif_matrix_{sae_pool.removeprefix('sae_')}"
+
+
+def _sync(out_dir: Path, remote: str | None) -> None:
+    if remote:
+        subprocess.run(["rclone", "copy", f"{out_dir}/", f"{remote.rstrip('/')}/{out_dir.name}/",
+                        "--checksum", "-q"], capture_output=True, text=True)
+
+
+def run_motif_fold(
     fold: str,
-    layer: str,
-    seed: str,
+    layers: Sequence[str] = DEFAULT_LAYERS,
+    seeds: Sequence[str] = DEFAULT_SEEDS,
+    *,
     base_dir: Path = Path("/mnt/ag"),
+    sae_pool: str = "sae",
+    out_root: Path | None = None,
     out_dir: Path | None = None,
     triad_dir: Path | None = None,
-) -> None:
-    """Execute motif causal evaluation for a single (fold, layer, seed) configuration."""
+    feature: int | None = None,
+    drive_remote: str | None = None,
+    n_windows: int = 25,
+    p_threshold: float = 1e-5,
+    shuffle_method: str = "shuffle",
+    max_batch: int = 4,
+    device: str = "cuda",
+) -> int:
+    """Every (layer, seed) of one fold with AlphaGenome loaded once. Returns #done."""
     from alphagenome_pytorch import AlphaGenome
     from alphagenome_pytorch.config import DtypePolicy
     from ag_sae.sae import BorzoiSAE
 
-    t0 = time.time()
-    config_name = f"{fold}_{layer}_{seed}"
-    effective_out = out_dir or (base_dir / "analysis_runs" / "motif_matrix" / config_name)
-    effective_out.mkdir(parents=True, exist_ok=True)
+    subdir = matrix_subdir(sae_pool)
+    out_root = out_root or (base_dir / "analysis_runs" / subdir)
+    configs = [(layer, seed) for layer in layers for seed in seeds]
+    if out_dir is not None and len(configs) != 1:
+        raise ValueError("out_dir is for a single configuration")
+    targets = {c: out_dir or out_root / f"{fold}_{c[0]}_{c[1]}" for c in configs}
+    todo = [c for c in configs if not is_valid_motif_summary(targets[c] / "motif_causal_summary.json")]
+    for c in configs:
+        if c not in todo:
+            print(f"  [SKIPPED] {fold}_{c[0]}_{c[1]} already complete")
+            _sync(targets[c], drive_remote)
+    if not todo:
+        return len(configs)
 
-    print("=" * 80)
-    print(f"STARTING MOTIF CAUSAL RUN: {config_name}")
-    print(f"Output: {effective_out}")
-    print("=" * 80)
+    paths = resolve_fold_paths(base_dir, fold)
+    motif = get_canonical_ctcf_motif(paths["jaspar"])
+    manifest = pd.read_parquet(paths["manifest"])
+    test_windows = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
+                    for r in manifest.loc[manifest.split == "test"].itertuples()]
+    motif_windows = prepare_motif_windows(test_windows, paths["fasta"], motif, n_windows=n_windows,
+                                          p_threshold=p_threshold, shuffle_method=shuffle_method)
 
-    # 1. Determine target feature ID from previous campaign triad summary
-    target_feature_id = 4586  # Safe default (CTCF in fold1 b8)
-    triad_summary_file = (triad_dir or (base_dir / "analysis_runs" / "campaign_matrix" / config_name)) / "regulatory_triad_summary.json"
-    if triad_summary_file.is_file():
-        try:
-            triad_data = json.loads(triad_summary_file.read_text())
-            if "CTCF_Insulator" in triad_data and "feature_id" in triad_data["CTCF_Insulator"]:
-                target_feature_id = int(triad_data["CTCF_Insulator"]["feature_id"])
-                print(f"Loaded CTCF_Insulator feature ID from campaign summary: F{target_feature_id}")
-        except Exception as e:
-            print(f"Warning: Failed to load triad summary ({e}), using default F{target_feature_id}")
-
-    # 2. Paths
-    fold_num = fold.replace("fold", "")
-    manifest_candidates = [
-        base_dir / "analysis-code-a1f31ce" / "manifests" / f"window_manifest_fold{fold_num}.parquet",
-        Path.home() / "ag" / "manifests" / f"window_manifest_fold{fold_num}.parquet",
-        base_dir / "inputs" / f"manifest_{fold}.parquet",
-    ]
-    manifest_path = next((p for p in manifest_candidates if p.is_file()), manifest_candidates[0])
-
-    fasta_candidates = [
-        base_dir / "data" / "GRCh38.primary_assembly.genome.fa",
-        base_dir / "inputs" / "genome.fa",
-    ]
-    fasta_path = next((p for p in fasta_candidates if p.is_file()), fasta_candidates[0])
-
-    weights_candidates = [
-        base_dir / "weights" / f"model_fold_{fold_num}.safetensors",
-        base_dir / "weights" / fold,
-    ]
-    weights_path = next((p for p in weights_candidates if p.exists()), weights_candidates[0])
-
-    sae_candidates = [
-        base_dir / "sae" / fold / f"{layer}_{seed}" / "best.pt",
-        base_dir / "sae" / fold / layer / seed / "checkpoints" / "best.pt",
-    ]
-    sae_path = next((p for p in sae_candidates if p.is_file()), sae_candidates[0])
-
-    jaspar_candidates = [
-        base_dir / "data" / "jaspar" / "JASPAR2024_CORE_vertebrates_non-redundant_pfms_jaspar.txt",
-        Path("data/jaspar/JASPAR2024_CORE_vertebrates_non-redundant_pfms_jaspar.txt"),
-    ]
-    jaspar_path = next((p for p in jaspar_candidates if p.is_file()), jaspar_candidates[0])
-
-    motif = get_canonical_ctcf_motif(jaspar_path)
-    tap = TAPS[layer]
-
-    print(f"Loading SAE from {sae_path}...")
-    sae = BorzoiSAE.from_checkpoint(sae_path, device="cuda")
-
-    print(f"Loading AlphaGenome from {weights_path}...")
-    model = AlphaGenome.from_pretrained(weights_path, dtype_policy=DtypePolicy.mixed_precision(), device="cuda")
+    print(f"Loading AlphaGenome {paths['weights']}...")
+    model = AlphaGenome.from_pretrained(paths["weights"], dtype_policy=DtypePolicy.mixed_precision(),
+                                        device=device)
     model.eval().requires_grad_(False)
-    organism = torch.tensor([0], device="cuda")
 
-    # 3. Load manifest test split windows
-    manifest = pd.read_parquet(manifest_path)
-    test_slice = manifest.loc[manifest.split == "test"]
-    windows = [
-        {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-        for row in test_slice.itertuples()
-    ]
-
-    # 4. Execute 2x2 Factorial Causal Cohort
-    run_motif_causal_cohort(
-        sae=sae,
-        model=model,
-        tap=tap,
-        windows=windows,
-        fasta_path=fasta_path,
-        organism=organism,
-        target_feature_id=target_feature_id,
-        motif=motif,
-        out_dir=effective_out,
-        min_score_ratio=0.5,
-        max_measured_windows=25,
-    )
-
-    print(f"\nConfiguration {config_name} finished in {time.time()-t0:.1f}s!\n")
+    done = len(configs) - len(todo)
+    for layer, seed in todo:
+        t0 = time.time()
+        config_name = f"{fold}_{layer}_{seed}"
+        target = targets[(layer, seed)]
+        target.mkdir(parents=True, exist_ok=True)
+        tap = TAPS[layer]
+        sae_path = resolve_sae_path(base_dir, sae_pool, fold, layer, seed)
+        print("=" * 80 + f"\nMOTIF RUN {config_name} (pool {sae_pool}) <- {sae_path}\n" + "=" * 80)
+        sae = BorzoiSAE.from_checkpoint(sae_path, device=device)
+        feature_id, source = resolve_ctcf_feature(
+            sae, model, tap, base_dir=base_dir, fold=fold, layer=layer, config_name=config_name,
+            sae_pool=sae_pool, manifest=manifest, fasta_path=paths["fasta"],
+            triad_dir=triad_dir, feature=feature)
+        print(f"CTCF feature F{feature_id} ({source})")
+        _atomic_json(target / "motif_windows.json", {
+            "fold": fold, "feature_id": feature_id, "feature_source": source,
+            "sae_checkpoint": str(sae_path), "p_threshold": p_threshold,
+            "shuffle_method": shuffle_method, "windows": [w.record() for w in motif_windows]})
+        run_motif_causal_cohort(sae, model, tap, motif_windows, motif, feature_id, target,
+                                max_batch=max_batch, device=device)
+        _sync(target, drive_remote)
+        del sae
+        cleanup_gpu()
+        done += 1
+        print(f"Configuration {config_name} finished in {time.time() - t0:.1f}s")
+    del model
+    cleanup_gpu()
+    return done
 
 
 def run_motif_matrix_campaign(
-    folds: tuple[str, ...] = ALL_FOLDS,
-    layers: tuple[str, ...] = DEFAULT_LAYERS,
-    seeds: tuple[str, ...] = DEFAULT_SEEDS,
+    folds: Sequence[str] = ALL_FOLDS,
+    layers: Sequence[str] = DEFAULT_LAYERS,
+    seeds: Sequence[str] = DEFAULT_SEEDS,
     base_dir: Path = Path("/mnt/ag"),
-    drive_remote: str = "gdrive:alphagenome_sae/motif_matrix",
+    drive_remote: str | None = None,
+    sae_pool: str = "sae",
     dry_run: bool = False,
+    **fold_kwargs,
 ) -> None:
-    """Execute complete 36-configuration motif campaign matrix with process isolation."""
-    base_out_dir = base_dir / "analysis_runs" / "motif_matrix"
-    if not dry_run:
-        try:
-            base_out_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-    configs = [(f, l, s) for f in folds for l in layers for s in seeds]
-    total = len(configs)
-
-    print("=" * 80)
-    print(f"STARTING MOTIF CAMPAIGN MATRIX: {len(folds)} Folds x {len(layers)} Layers x {len(seeds)} Seeds ({total} Configs)")
-    print(f"Output directory: {base_out_dir}")
-    print(f"Drive destination: {drive_remote}")
-    print("=" * 80)
-
-    t_start = time.time()
-    completed = 0
-
-    for step, (fold, layer, seed) in enumerate(configs, 1):
-        config_name = f"{fold}_{layer}_{seed}"
-        out_dir = base_out_dir / config_name
-        summary_file = out_dir / "motif_causal_summary.json"
-
-        print(f"\n>>> [STEP {step}/{total}] Configuration: {config_name}")
-
-        if is_valid_motif_summary(summary_file):
-            if not dry_run and drive_remote:
-                target_drive = f"{drive_remote.rstrip('/')}/{config_name}/"
-                sync_cmd = ["rclone", "copy", f"{out_dir}/", target_drive, "--checksum", "-q"]
-                subprocess.run(sync_cmd, capture_output=True, text=True)
-            print(f"  [SKIPPED] {config_name} already completed and verified.")
-            completed += 1
-            continue
-
-        cmd = [
-            sys.executable, "-u", "-m", "ag_sae.motif_intervene",
-            "--fold", fold,
-            "--layer", layer,
-            "--seed", seed,
-            "--out", str(out_dir),
-        ]
-
-        if dry_run:
-            print(f"  [DRY-RUN] Would execute: {' '.join(cmd)}")
-            continue
-
-        t_step = time.time()
-        res = subprocess.run(cmd)
-
-        if res.returncode != 0:
-            print(f"\n[ERROR] Step {step}/{total} failed with returncode {res.returncode} for {config_name}!", file=sys.stderr)
-            sys.exit(res.returncode)
-
-        if not is_valid_motif_summary(summary_file):
-            print(f"\n[ERROR] Output file {summary_file} missing or corrupt for {config_name}!", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"  [SUCCESS] Finished {config_name} in {time.time()-t_step:.1f}s!")
-
-        if drive_remote:
-            target_drive = f"{drive_remote.rstrip('/')}/{config_name}/"
-            print(f"  Syncing to Google Drive ({target_drive})...")
-            sync_cmd = ["rclone", "copy", f"{out_dir}/", target_drive, "--checksum", "-q"]
-            sync_res = subprocess.run(sync_cmd, capture_output=True, text=True)
-            if sync_res.returncode != 0:
-                print(f"  [Warning] Drive sync returned non-zero code {sync_res.returncode}")
-
-        completed += 1
-
-    total_elapsed = time.time() - t_start
-    print("\n" + "=" * 80)
-    print(f"MOTIF CAMPAIGN MATRIX COMPLETED! {completed}/{total} configurations in {total_elapsed:.1f}s ({total_elapsed/60:.1f}m)")
-    print("=" * 80)
+    """Every fold in turn; each fold loads AlphaGenome once for all its configurations."""
+    subdir = matrix_subdir(sae_pool)
+    remote = drive_remote or f"gdrive:alphagenome_sae/{subdir}"
+    total = len(folds) * len(layers) * len(seeds)
+    print(f"MOTIF CAMPAIGN: {len(folds)} folds x {len(layers)} layers x {len(seeds)} seeds "
+          f"= {total} configurations (pool {sae_pool}) -> {base_dir / 'analysis_runs' / subdir}")
+    if dry_run:
+        for fold in folds:
+            for layer in layers:
+                for seed in seeds:
+                    print(f"  [DRY-RUN] {fold}_{layer}_{seed}")
+        return
+    t0, done = time.time(), 0
+    for fold in folds:
+        done += run_motif_fold(fold, layers, seeds, base_dir=base_dir, sae_pool=sae_pool,
+                               drive_remote=remote, **fold_kwargs)
+    print(f"MOTIF CAMPAIGN COMPLETE: {done}/{total} in {(time.time() - t0) / 60:.1f} min")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AlphaGenome-SAE Motif Causal Intervention Engine")
     parser.add_argument("--campaign", action="store_true", help="Run full matrix campaign")
     parser.add_argument("--all-folds", action="store_true", help="Include all 4 genomic folds in campaign")
-    parser.add_argument("--fold", type=str, default="fold1", help="Genomic fold (e.g. fold0, fold1)")
+    parser.add_argument("--fold", type=str, default="fold1", help="Genomic fold (e.g. fold0, fold1, fold3)")
     parser.add_argument("--layer", type=str, default="resid_pre_b8", help="Tap layer name")
     parser.add_argument("--seed", type=str, default="seed0", help="Training seed (e.g. seed0)")
-    parser.add_argument("--out", type=Path, default=None, help="Output directory")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
-
+    parser.add_argument("--sae-pool", type=str, default="sae",
+                        help="SAE directory under --base-dir (sae, sae_k64, sae_v2, ...)")
+    parser.add_argument("--base-dir", type=Path, default=Path("/mnt/ag"))
+    parser.add_argument("--out", type=Path, default=None, help="Output directory (single config)")
+    parser.add_argument("--feature", type=int, default=None, help="CTCF feature id to test (single config)")
+    parser.add_argument("--n-windows", type=int, default=25)
+    parser.add_argument("--p-threshold", type=float, default=1e-5, help="FIMO p-value for a site")
+    parser.add_argument("--ism", choices=("shuffle", "dinucleotide"), default="shuffle")
+    parser.add_argument("--max-batch", type=int, default=4,
+                        help="conditions per forward; 4 on an 80 GB A100, 2 on 40 GB")
+    parser.add_argument("--dry-run", action="store_true", help="Print configurations without executing")
     args = parser.parse_args(argv)
 
+    fold_kwargs = dict(n_windows=args.n_windows, p_threshold=args.p_threshold,
+                       shuffle_method=args.ism, max_batch=args.max_batch)
     if args.campaign:
-        folds = ALL_FOLDS if args.all_folds else (args.fold,)
-        run_motif_matrix_campaign(folds=folds, dry_run=args.dry_run)
+        folds = (("fold3",) if args.sae_pool == "sae_k64" and not args.all_folds
+                 else ALL_FOLDS if args.all_folds else (args.fold,))
+        run_motif_matrix_campaign(folds=folds, base_dir=args.base_dir, sae_pool=args.sae_pool,
+                                  dry_run=args.dry_run, **fold_kwargs)
     else:
-        run_motif_configuration(fold=args.fold, layer=args.layer, seed=args.seed, out_dir=args.out)
-
+        run_motif_fold(args.fold, (args.layer,), (args.seed,), base_dir=args.base_dir,
+                       sae_pool=args.sae_pool, out_dir=args.out, feature=args.feature,
+                       **fold_kwargs)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
