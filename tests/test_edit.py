@@ -230,3 +230,34 @@ class TestAutocastIsolation:
         expected, _ = sae.encode_codes(stream)             # fp32, outside any autocast
         assert memo["recon"].dtype == torch.float32
         torch.testing.assert_close(memo["recon"], expected, rtol=1e-6, atol=1e-6)
+
+
+class TestOutOfMemorySplit:
+    def test_a_chunk_that_does_not_fit_is_split_and_gives_the_same_results(self, model, sae, monkeypatch):
+        x = random_sequences(1)
+        conditions = [E.Condition("original")] + [
+            E.Condition(f"ablate{f}", 0, [3, 4, 5], E.sae_edit(sae, f"ablate{f}", E.zero_feature(f)))
+            for f in range(5)]
+        readout = E.track_mean_profile(("chip_tf",))
+        expected = E.run_conditions(model, 2, x, conditions, readout, heads=("chip_tf",), max_batch=6)
+        real_predict, sizes = model.predict, []
+
+        def tight_predict(dna, *args, **kwargs):
+            sizes.append(len(dna))
+            if len(dna) > 2:
+                raise torch.cuda.OutOfMemoryError("simulated")
+            return real_predict(dna, *args, **kwargs)
+
+        monkeypatch.setattr(model, "predict", tight_predict)
+        got = E.run_conditions(model, 2, x, conditions, readout, heads=("chip_tf",), max_batch=6)
+        assert sizes[0] == 6 and max(s for s in sizes if s <= 2) <= 2
+        for name in expected:
+            np.testing.assert_allclose(got[name]["chip_tf"], expected[name]["chip_tf"], rtol=1e-5, atol=1e-6)
+
+    def test_a_single_condition_that_does_not_fit_still_raises(self, model, sae, monkeypatch):
+        def no_room(*_a, **_k):
+            raise torch.cuda.OutOfMemoryError("simulated")
+        monkeypatch.setattr(model, "predict", no_room)
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            E.run_conditions(model, 2, random_sequences(1), [E.Condition("original")],
+                             E.track_mean_profile(("chip_tf",)), heads=("chip_tf",))

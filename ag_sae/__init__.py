@@ -1,5 +1,12 @@
 """Sparse autoencoders on AlphaGenome activations."""
 
+import os as _os
+
+# Batched 1 Mb forwards fragment the CUDA cache (an A100 run hit OOM with 33 GB
+# reserved but free); expandable segments avoid that. Set before torch starts
+# CUDA, and only if the user has not chosen something else.
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 __all__ = ["FrozenSAE", "MatchResult", "match_concepts", "read_ccre_bed"]
 
 

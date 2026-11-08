@@ -153,7 +153,7 @@ def run_conditions(
     memo = {} if memo is None else memo
     results: dict[str, Any] = {}
     device = sequences.device
-    for chunk in _chunks(list(conditions), max_batch):
+    def forward(chunk: Sequence[Condition]) -> dict:
         index = torch.tensor([c.sequence for c in chunk], device=device)
         batch = sequences.index_select(0, index).float()
         positions = [None if c.bins is None else
@@ -189,11 +189,33 @@ def run_conditions(
             return out
 
         with ResidualEdit(model, block_index, edit_stream):
-            outputs = model.predict(batch, organism, resolutions=(128,),
-                                    heads=tuple(heads), channels_last=True)
+            return model.predict(batch, organism, resolutions=(128,),
+                                 heads=tuple(heads), channels_last=True)
+
+    def run(chunk: Sequence[Condition]) -> None:
+        # A chunk that does not fit (fragmentation can make the same batch fit
+        # one window and not the next) is split in half and retried; edits are
+        # deterministic, so conditions re-run in a smaller chunk give the same
+        # memo entries.
+        try:
+            outputs = forward(chunk)
+        except torch.cuda.OutOfMemoryError:
+            if len(chunk) == 1:
+                raise
+            outputs = None
+        if outputs is None:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            half = (len(chunk) + 1) // 2
+            run(chunk[:half])
+            run(chunk[half:])
+            return
         for b, condition in enumerate(chunk):
             results[condition.name] = readout(outputs, b)
         del outputs
+
+    for chunk in _chunks(list(conditions), max_batch):
+        run(chunk)
     return results
 
 
