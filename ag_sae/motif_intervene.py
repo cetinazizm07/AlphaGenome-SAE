@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -431,7 +432,8 @@ def matrix_subdir(sae_pool: str, protocol: str = "legacy") -> str:
 
 
 def _sync(out_dir: Path, remote: str | None) -> None:
-    if remote:
+    # Colab mounts Drive instead of having rclone; there the caller copies.
+    if remote and shutil.which("rclone"):
         subprocess.run(["rclone", "copy", f"{out_dir}/", f"{remote.rstrip('/')}/{out_dir.name}/",
                         "--checksum", "-q"], capture_output=True, text=True)
 
