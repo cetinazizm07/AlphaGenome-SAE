@@ -141,7 +141,9 @@ def run_conditions(
     """Run every condition and return {condition name: readout}.
 
     `sequences` is (n, L, 4) on the model's device, in any float or uint8
-    dtype. Conditions are run in order, `max_batch` at a time.
+    dtype. Conditions are run in order, `max_batch` at a time. For every
+    edited condition memo["edit_norms"][name] holds the L2 size of the change
+    the edit asked for and of the change that reached the stream.
     """
     if max_batch < 1:
         raise ValueError("max_batch must be positive")
@@ -175,7 +177,15 @@ def run_conditions(
                 replacement = condition.edit(rows, memo)
                 if replacement.shape != rows.shape:
                     raise ValueError(f"{condition.name}: edit changed the row shape")
-                out[b, where] = replacement.to(x.dtype)
+                stored = replacement.to(x.dtype)
+                # In a bf16 stream a change below half an ulp is rounded away;
+                # recording both norms shows when that happens.
+                memo.setdefault("edit_norms", {})[condition.name] = {
+                    "intended": float((replacement - rows).norm()),
+                    "realized": float((stored.float() - rows).norm()),
+                    "stream_dtype": str(x.dtype).removeprefix("torch."),
+                }
+                out[b, where] = stored
             return out
 
         with ResidualEdit(model, block_index, edit_stream):
@@ -194,25 +204,45 @@ def run_conditions(
 CodeChange = Callable[[torch.Tensor, dict], torch.Tensor]
 
 
-def sae_edit(sae: Any, record: str, change: CodeChange | None = None) -> RowEdit:
-    """Replace rows by their SAE reconstruction, optionally after changing codes.
+def sae_edit(sae: Any, record: str, change: CodeChange | None = None, *,
+             preserve_error: bool = False) -> RowEdit:
+    """Edit rows through the SAE, optionally after changing codes.
 
     The unchanged codes are stored as memo[record], so later conditions can
     refer to them. `change(codes, memo)` gets a copy and returns the codes to
     decode.
+
+    By default the rows are replaced by the decoded codes, which also drops
+    what the SAE cannot reconstruct; the right baseline is then the plain
+    reconstruction. With `preserve_error` only the change is applied:
+    ``rows + decode(changed) - decode(codes)``, so the reconstruction error
+    stays in the stream, an unchanged code leaves the rows untouched, and the
+    right baseline is the unedited model.
     """
     def edit(rows: torch.Tensor, memo: dict) -> torch.Tensor:
         codes, params = sae.encode_codes(rows)
         memo[record] = codes
-        if change is not None:
-            codes = change(codes.clone(), memo)
-        return sae.decode_codes(codes, params)
+        if change is None:
+            return rows if preserve_error else sae.decode_codes(codes, params)
+        changed = sae.decode_codes(change(codes.clone(), memo), params)
+        if preserve_error:
+            return rows + (changed - sae.decode_codes(codes, params))
+        return changed
     return edit
 
 
 def zero_feature(feature: int) -> CodeChange:
+    return zero_features([feature])
+
+
+def zero_features(features: Sequence[int]) -> CodeChange:
+    """Silence several features at once (joint ablation)."""
+    index = list(dict.fromkeys(int(f) for f in features))
+    if not index:
+        raise ValueError("no features to zero")
+
     def change(codes, _memo):
-        codes[:, feature] = 0
+        codes[:, index] = 0
         return codes
     return change
 
@@ -223,6 +253,14 @@ def set_feature_from(feature: int, source: str) -> CodeChange:
         if source not in memo:
             raise KeyError(f"condition {source!r} must run before it is referenced")
         codes[:, feature] = memo[source][:, feature]
+        return codes
+    return change
+
+
+def add_to_feature(feature: int, amount: float) -> CodeChange:
+    """Raise a feature by a fixed amount, whatever its current value."""
+    def change(codes, _memo):
+        codes[:, feature] = codes[:, feature] + amount
         return codes
     return change
 

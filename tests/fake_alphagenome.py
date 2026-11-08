@@ -65,6 +65,10 @@ class FakeAlphaGenome(nn.Module):
         with torch.autocast(dna.device.type, dtype=torch.bfloat16, enabled=self.autocast):
             return self._forward(dna, organism, **kwargs)
 
+    def encode(self, dna, organism_index=0, resolutions=(128,)):
+        # Extraction's entry point; it has no autocast wrapper here.
+        return self._forward(dna, organism_index, resolutions=resolutions, embeddings_only=True)
+
     def _forward(self, dna, organism, resolutions=(128,), heads=None,
                  channels_last=True, embeddings_only=False):
         self.calls += 1

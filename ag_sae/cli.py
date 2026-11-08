@@ -16,6 +16,7 @@ STAGES: dict[str, tuple[str, str]] = {
     "matrix": ("matrix", "cmd_matrix"),
     "motif": ("motif_intervene", "main"),
     "motif_campaign": ("motif_intervene", "main"),
+    "analyze": ("analyze", "main"),
 }
 
 

@@ -44,6 +44,7 @@ def run_matrix_campaign(
     dry_run: bool = False,
     sae_pool: str = "sae",
     max_batch: int = 3,
+    protocol: str = "v2",
 ) -> None:
     """Execute evaluation matrix with process isolation and automatic resumption."""
     base_out_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +87,7 @@ def run_matrix_campaign(
             "--seed", seed,
             "--sae-pool", sae_pool,
             "--max-batch", str(max_batch),
+            "--protocol", protocol,
             "--out", str(out_dir),
         ]
 
@@ -136,17 +138,21 @@ def cmd_matrix(argv: list[str] | None = None) -> int:
                         help="SAE directory under /mnt/ag (sae, sae_k64, sae_v2, ...)")
     parser.add_argument("--max-batch", type=int, default=3,
                         help="conditions per forward; 3-4 on an 80 GB A100, 1-2 on 40 GB")
+    parser.add_argument("--protocol", choices=["v2", "legacy"], default="v2",
+                        help="feature selection and edit protocol passed to intervene; v2 results go "
+                             "to campaign_matrix[_<pool>]_protocol_v2")
     parser.add_argument("--out-dir", type=Path, default=None,
-                        help="default /mnt/ag/analysis_runs/campaign_matrix[_<pool>]")
+                        help="default /mnt/ag/analysis_runs/campaign_matrix[_<pool>][_protocol_v2]")
     parser.add_argument("--drive-remote", type=str, default=None,
-                        help="default gdrive:alphagenome_sae/campaign_matrix[_<pool>]")
+                        help="default gdrive:alphagenome_sae/campaign_matrix[_<pool>][_protocol_v2]")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
 
     args = parser.parse_args(argv)
     layers = tuple(p.strip() for p in args.layers.split(",") if p.strip())
     seeds = tuple(f"seed{p.strip().removeprefix('seed')}" for p in args.seeds.split(",") if p.strip())
     # Matches the triad directory that motif_intervene.resolve_ctcf_feature reads.
-    name = "campaign_matrix" if args.sae_pool == "sae" else f"campaign_matrix_{args.sae_pool}"
+    from ag_sae.intervene import campaign_name
+    name = campaign_name(args.sae_pool, args.protocol)
 
     run_matrix_campaign(
         fold=args.fold,
@@ -157,5 +163,6 @@ def cmd_matrix(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         sae_pool=args.sae_pool,
         max_batch=args.max_batch,
+        protocol=args.protocol,
     )
     return 0

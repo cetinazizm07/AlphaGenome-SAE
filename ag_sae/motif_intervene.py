@@ -164,6 +164,28 @@ class MotifWindow:
         return out
 
 
+def motif_candidates(manifest: pd.DataFrame, protocol: str = "legacy") -> list[dict]:
+    """Test windows to scan for motif sites, in the order they are tried.
+
+    legacy: manifest order, which clusters the first sites on a few
+    chromosomes. v2: the windows that chose the triad's features and dose
+    (intervene.split_windows) are left out, and the rest are tried in a
+    fixed-seed random order, so the sites spread over the held-out regions.
+    """
+    from ag_sae.intervene import Protocol, split_windows
+
+    windows = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
+               for r in manifest.loc[manifest.split == "test"].itertuples()]
+    chosen = Protocol.named(protocol)
+    if chosen.name == "legacy":
+        return windows
+    _evaluation, calibration = split_windows(manifest, chosen)
+    taken = {(w["chrom"], w["start"], w["end"]) for w in calibration}
+    windows = [w for w in windows if (w["chrom"], w["start"], w["end"]) not in taken]
+    order = np.random.default_rng(chosen.window_seed + 2).permutation(len(windows))
+    return [windows[i] for i in order]
+
+
 def prepare_motif_windows(
     windows: Sequence[dict],
     fasta_path: Path,
@@ -175,7 +197,7 @@ def prepare_motif_windows(
     shuffle_method: str = "shuffle",
     log=print,
 ) -> list[MotifWindow]:
-    """Strongest FIMO site per window, in manifest order, until `n_windows`.
+    """Strongest FIMO site per window, in the order given, until `n_windows`.
 
     The ISM sequence shuffles the site with tangermeme.ersatz; each window's
     shuffle has its own seed (seed + its rank) so the mutants do not depend on
@@ -349,19 +371,22 @@ def resolve_sae_path(base_dir: Path, sae_pool: str, fold: str, layer: str, seed:
 def resolve_ctcf_feature(sae, model, tap, *, base_dir: Path, fold: str, layer: str,
                          config_name: str, sae_pool: str, manifest: pd.DataFrame,
                          fasta_path: Path, triad_dir: Path | None = None,
-                         feature: int | None = None) -> tuple[int, str]:
+                         feature: int | None = None, protocol: str = "legacy",
+                         exclude_windows: Sequence[Any] = ()) -> tuple[int, str]:
     """The CTCF feature to test and where it came from.
 
     Order: an explicit --feature; the triad campaign's summary for this
     configuration; discovery on calibration windows. Unlike the first campaign
     there is no hard-coded fallback: a feature picked for another fold and
     layer would make the run meaningless, so failure stops the configuration.
+    The triad summary is read from, and discovery follows, `protocol`; under
+    v2 the discovery windows avoid `exclude_windows` (the measured windows).
     """
     if feature is not None:
         return int(feature), "explicit"
     if triad_dir is None:
-        name = "campaign_matrix" if sae_pool == "sae" else f"campaign_matrix_{sae_pool}"
-        triad_dir = base_dir / "analysis_runs" / name / config_name
+        from ag_sae.intervene import campaign_name
+        triad_dir = base_dir / "analysis_runs" / campaign_name(sae_pool, protocol) / config_name
     triad_file = triad_dir / "regulatory_triad_summary.json"
     if triad_file.is_file():
         data = json.loads(triad_file.read_text())
@@ -373,23 +398,36 @@ def resolve_ctcf_feature(sae, model, tap, *, base_dir: Path, fold: str, layer: s
     if annotations_path is None:
         raise FileNotFoundError(f"{config_name}: no triad summary and no annotations to discover "
                                 "the CTCF feature; pass --feature")
-    from ag_sae.intervene import discover_concept_features
+    from ag_sae.intervene import Protocol, discover_concept_features
 
+    chosen = Protocol.named(protocol)
     calibration = manifest.loc[manifest.split == "calibration"]
     if calibration.empty:
-        calibration = manifest.loc[manifest.split == "test"].iloc[:10]
+        calibration = manifest.loc[manifest.split == "test"]
+        if chosen.name != "legacy":
+            measured = [(w.chrom, int(w.start), int(w.end)) for w in exclude_windows]
+            keep = [not any(r.chrom == c and int(r.win_start) < e and s < int(r.win_end)
+                            for c, s, e in measured) for r in calibration.itertuples()]
+            calibration = calibration.loc[keep]
+        calibration = calibration.iloc[:10]
     windows = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
                for r in calibration.itertuples()]
     found = discover_concept_features(sae=sae, model=model, tap=tap, calibration_windows=windows,
                                       annotations=pd.read_parquet(annotations_path),
                                       fasta_path=fasta_path, organism=torch.tensor([0], device="cuda"),
-                                      max_calibration_windows=10)
+                                      max_calibration_windows=10, score=chosen.score,
+                                      top_n=chosen.top_n, min_fire_rate=chosen.min_fire_rate)
     return int(found.insulator_feature_id), f"discovered:{annotations_path}"
 
 
-def matrix_subdir(sae_pool: str) -> str:
-    """Output folder of a pool: motif_matrix, motif_matrix_k64, motif_matrix_<pool>."""
-    return "motif_matrix" if sae_pool == "sae" else f"motif_matrix_{sae_pool.removeprefix('sae_')}"
+def matrix_subdir(sae_pool: str, protocol: str = "legacy") -> str:
+    """Output folder of a pool: motif_matrix, motif_matrix_k64, motif_matrix_<pool>.
+
+    Non-legacy protocols append _protocol_<name>, matching the triad folders.
+    """
+    from ag_sae.intervene import protocol_suffix
+    base = "motif_matrix" if sae_pool == "sae" else f"motif_matrix_{sae_pool.removeprefix('sae_')}"
+    return base + protocol_suffix(protocol)
 
 
 def _sync(out_dir: Path, remote: str | None) -> None:
@@ -415,13 +453,14 @@ def run_motif_fold(
     shuffle_method: str = "shuffle",
     max_batch: int = 4,
     device: str = "cuda",
+    protocol: str = "v2",
 ) -> int:
     """Every (layer, seed) of one fold with AlphaGenome loaded once. Returns #done."""
     from alphagenome_pytorch import AlphaGenome
     from alphagenome_pytorch.config import DtypePolicy
     from ag_sae.sae import BorzoiSAE
 
-    subdir = matrix_subdir(sae_pool)
+    subdir = matrix_subdir(sae_pool, protocol)
     out_root = out_root or (base_dir / "analysis_runs" / subdir)
     configs = [(layer, seed) for layer in layers for seed in seeds]
     if out_dir is not None and len(configs) != 1:
@@ -438,8 +477,7 @@ def run_motif_fold(
     paths = resolve_fold_paths(base_dir, fold)
     motif = get_canonical_ctcf_motif(paths["jaspar"])
     manifest = pd.read_parquet(paths["manifest"])
-    test_windows = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
-                    for r in manifest.loc[manifest.split == "test"].itertuples()]
+    test_windows = motif_candidates(manifest, protocol)
     motif_windows = prepare_motif_windows(test_windows, paths["fasta"], motif, n_windows=n_windows,
                                           p_threshold=p_threshold, shuffle_method=shuffle_method)
 
@@ -461,10 +499,10 @@ def run_motif_fold(
         feature_id, source = resolve_ctcf_feature(
             sae, model, tap, base_dir=base_dir, fold=fold, layer=layer, config_name=config_name,
             sae_pool=sae_pool, manifest=manifest, fasta_path=paths["fasta"],
-            triad_dir=triad_dir, feature=feature)
+            triad_dir=triad_dir, feature=feature, protocol=protocol, exclude_windows=motif_windows)
         print(f"CTCF feature F{feature_id} ({source})")
         _atomic_json(target / "motif_windows.json", {
-            "fold": fold, "feature_id": feature_id, "feature_source": source,
+            "fold": fold, "feature_id": feature_id, "feature_source": source, "protocol": protocol,
             "sae_checkpoint": str(sae_path), "p_threshold": p_threshold,
             "shuffle_method": shuffle_method, "windows": [w.record() for w in motif_windows]})
         run_motif_causal_cohort(sae, model, tap, motif_windows, motif, feature_id, target,
@@ -487,10 +525,11 @@ def run_motif_matrix_campaign(
     drive_remote: str | None = None,
     sae_pool: str = "sae",
     dry_run: bool = False,
+    protocol: str = "v2",
     **fold_kwargs,
 ) -> None:
     """Every fold in turn; each fold loads AlphaGenome once for all its configurations."""
-    subdir = matrix_subdir(sae_pool)
+    subdir = matrix_subdir(sae_pool, protocol)
     remote = drive_remote or f"gdrive:alphagenome_sae/{subdir}"
     total = len(folds) * len(layers) * len(seeds)
     print(f"MOTIF CAMPAIGN: {len(folds)} folds x {len(layers)} layers x {len(seeds)} seeds "
@@ -504,7 +543,7 @@ def run_motif_matrix_campaign(
     t0, done = time.time(), 0
     for fold in folds:
         done += run_motif_fold(fold, layers, seeds, base_dir=base_dir, sae_pool=sae_pool,
-                               drive_remote=remote, **fold_kwargs)
+                               drive_remote=remote, protocol=protocol, **fold_kwargs)
     print(f"MOTIF CAMPAIGN COMPLETE: {done}/{total} in {(time.time() - t0) / 60:.1f} min")
 
 
@@ -525,6 +564,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ism", choices=("shuffle", "dinucleotide"), default="shuffle")
     parser.add_argument("--max-batch", type=int, default=4,
                         help="conditions per forward; 4 on an 80 GB A100, 2 on 40 GB")
+    parser.add_argument("--protocol", choices=("v2", "legacy"), default="v2",
+                        help="which triad campaign supplies the CTCF feature (and how to discover "
+                             "it without one); v2 results go to motif_matrix_<pool>_protocol_v2")
     parser.add_argument("--dry-run", action="store_true", help="Print configurations without executing")
     args = parser.parse_args(argv)
 
@@ -534,11 +576,11 @@ def main(argv: list[str] | None = None) -> int:
         folds = (("fold3",) if args.sae_pool == "sae_k64" and not args.all_folds
                  else ALL_FOLDS if args.all_folds else (args.fold,))
         run_motif_matrix_campaign(folds=folds, base_dir=args.base_dir, sae_pool=args.sae_pool,
-                                  dry_run=args.dry_run, **fold_kwargs)
+                                  dry_run=args.dry_run, protocol=args.protocol, **fold_kwargs)
     else:
         run_motif_fold(args.fold, (args.layer,), (args.seed,), base_dir=args.base_dir,
                        sae_pool=args.sae_pool, out_dir=args.out, feature=args.feature,
-                       **fold_kwargs)
+                       protocol=args.protocol, **fold_kwargs)
     return 0
 
 

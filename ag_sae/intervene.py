@@ -20,7 +20,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
@@ -31,8 +31,8 @@ try:
 except ImportError:
     torch = None
 
-from ag_sae.edit import (Condition, clamp_min_feature, run_conditions, sae_edit,
-                         track_mean_profile, zero_feature)
+from ag_sae.edit import (Condition, add_to_feature, clamp_min_feature, run_conditions, sae_edit,
+                         track_mean_profile, zero_feature, zero_features)
 from ag_sae.stats import StatisticalSummary, compute_paired_statistics, safe_wilcoxon
 
 ALL_HEADS: tuple[str, ...] = (
@@ -247,14 +247,33 @@ def checked_element_mask(labels: np.ndarray, n_positions: int = 8192) -> np.ndar
     return mask.copy()
 
 
+#: annotation column of each concept, in DiscoveredFeatures field order
+CONCEPT_COLUMNS: tuple[str, ...] = ("cCRE_PLS", "cCRE_CTCF_only", "cCRE_pELS", "shuffled_dELS")
+#: how a feature is ranked against a concept (see ConceptContrast)
+SCORES: tuple[str, ...] = ("cohen_d", "mean_diff")
+
+
 @dataclass(frozen=True)
 class DiscoveredFeatures:
-    """Maps biological regulatory concepts to their highest-scoring SAE latent IDs."""
+    """Maps biological regulatory concepts to their highest-scoring SAE latent IDs.
+
+    `ranked` holds, per annotation column, the best few features in score
+    order (the first is the field above) and `scores` their scores; both are
+    empty when the IDs were given by hand.
+    """
 
     promoter_feature_id: int
     insulator_feature_id: int
     enhancer_feature_id: int
     shuffled_control_feature_id: int
+    ranked: dict[str, tuple[int, ...]] = field(default_factory=dict, compare=False)
+    scores: dict[str, tuple[float, ...]] = field(default_factory=dict, compare=False)
+    score: str = "given"
+    #: share of the calibration windows' edited bins (edited_bins_mask) on
+    #: which each feature fires, for matched nulls
+    firing_rate: np.ndarray | None = field(default=None, compare=False, repr=False)
+    #: the best NEAR_TOP features of every real concept, kept out of null pools
+    near_top: tuple[int, ...] = field(default=(), compare=False, repr=False)
 
     def as_dict(self) -> dict[str, tuple[int, str]]:
         """Return mapping of {concept_name: (feature_id, annotation_column_name)}."""
@@ -264,6 +283,121 @@ class DiscoveredFeatures:
             "Enhancer_pELS": (self.enhancer_feature_id, "cCRE_pELS"),
             "Shuffled_Control": (self.shuffled_control_feature_id, "shuffled_dELS"),
         }
+
+    def top(self, column: str, n: int) -> tuple[int, ...]:
+        """The `n` best features for an annotation column (at least the primary one)."""
+        primary = {col: feat for feat, col in self.as_dict().values()}[column]
+        return self.ranked.get(column, (primary,))[:max(1, n)]
+
+    def to_json(self) -> dict:
+        return {"score": self.score,
+                "primary": {name: feat for name, (feat, _col) in self.as_dict().items()},
+                "ranked": {col: list(ids) for col, ids in self.ranked.items()},
+                "scores": {col: list(vals) for col, vals in self.scores.items()}}
+
+
+class ConceptContrast:
+    """Per-feature statistics of concept-positive against concept-negative bins.
+
+    Both scores contrast bins within a window, so a feature that is simply
+    higher in some windows (gene-dense, GC-rich) than in others does not win
+    because the positive bins happen to sit in those windows:
+
+    * ``mean_diff`` -- the first campaign's: positive-bin mean minus
+      negative-bin mean, averaged over windows. It is in activation units, so
+      features with large activations win regardless of how cleanly they
+      separate the bins.
+    * ``cohen_d`` -- the within-window mean difference (averaged over windows,
+      weighted by their positive bins) over the pooled within-window standard
+      deviation, which is scale-free. Features that fire on fewer than
+      `min_fire_rate` of the positive bins are not eligible, so a rare, very
+      large activation cannot win on its own.
+
+    Each window's deviations are taken from its own means on the device
+    (accurate in float32) and only then summed in float64.
+    """
+
+    def __init__(self) -> None:
+        self.window_diffs: list[np.ndarray] = []
+        self.weighted_diff: np.ndarray | None = None   # sum over windows of n_pos * diff
+        self.within_ss: np.ndarray | None = None       # sum of squared within-window deviations
+        self.fired: np.ndarray | None = None           # positive bins on which each feature fires
+        self.n_pos = 0
+        self.n_bins = 0
+        self.n_windows = 0
+
+    @staticmethod
+    def _add(total, value):
+        return value if total is None else total + value
+
+    def add(self, codes: torch.Tensor, pos: np.ndarray, neg: np.ndarray) -> None:
+        if not pos.any() or not neg.any():
+            return
+        p = codes[torch.as_tensor(pos, device=codes.device)].float()
+        q = codes[torch.as_tensor(neg, device=codes.device)].float()
+        mean_p, mean_q = p.mean(0), q.mean(0)
+        diff = (mean_p - mean_q).cpu().numpy()
+        ss = ((p - mean_p).square().sum(0) + (q - mean_q).square().sum(0)).cpu().double().numpy()
+        self.window_diffs.append(diff)
+        self.weighted_diff = self._add(self.weighted_diff, len(p) * diff.astype(np.float64))
+        self.within_ss = self._add(self.within_ss, ss)
+        self.fired = self._add(self.fired, (p > 0).sum(0).cpu().numpy().astype(np.int64))
+        self.n_pos += len(p)
+        self.n_bins += len(p) + len(q)
+        self.n_windows += 1
+
+    @property
+    def empty(self) -> bool:
+        return not self.window_diffs
+
+    def score(self, kind: str, min_fire_rate: float = 0.05) -> np.ndarray:
+        if self.empty:
+            raise ValueError("no contrastive bins")
+        if kind == "mean_diff":
+            return np.mean(self.window_diffs, axis=0).astype(np.float64)
+        if kind != "cohen_d":
+            raise ValueError(f"unknown score {kind!r}; expected one of {SCORES}")
+        # Two means estimated per window.
+        pooled = np.sqrt(self.within_ss / max(self.n_bins - 2 * self.n_windows, 1))
+        diff = self.weighted_diff / self.n_pos
+        # A floor on the SD: a feature that separates the bins perfectly (no
+        # spread within either group) ranks at the top instead of scoring 0.
+        d = diff / np.maximum(pooled, 1e-6)
+        return np.where(self.fired / self.n_pos >= min_fire_rate, d, -np.inf)
+
+
+#: runners-up per concept kept out of null pools (DiscoveredFeatures.near_top)
+NEAR_TOP = 20
+
+
+def edited_bins_mask(bins: pd.DataFrame, start: int, num_bins: int, bin_bp: int) -> np.ndarray:
+    """The bins the triad edits in a window: any cCRE (or PLS) plus shuffled_dELS."""
+    mask = np.zeros(num_bins, dtype=bool)
+    for column in (("cCRE_any",) if "cCRE_any" in bins.columns else ("cCRE_PLS",)) + ("shuffled_dELS",):
+        if column in bins.columns:
+            pos, _ = map_annotation_column_to_grid(bins, column, start, num_bins, bin_bp)
+            mask |= pos
+    return mask
+
+
+def _concept_column(bins: pd.DataFrame, column: str) -> str | None:
+    if column in bins.columns:
+        return column
+    if column == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
+        return "cCRE_CTCF-only"
+    return None
+
+
+def _window_codes(sae: Any, model: Any, tap: Any, fasta_path: Path, window: dict) -> torch.Tensor:
+    """SAE codes of every bin of a window, from the stream entering the tap block."""
+    from ag_sae.edit import capture_residual
+
+    seq = window_sequence(fasta_path, window["chrom"], int(window["start"]), int(window["end"]))
+    x = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(sae.channel_scale.device)
+    # Only the part of the model before the tap runs.
+    acts = capture_residual(model, int(tap.key), x)
+    codes, _ = sae.encode_codes(acts[0].float())
+    return codes
 
 
 def discover_concept_features(
@@ -275,65 +409,196 @@ def discover_concept_features(
     fasta_path: Path,
     organism: torch.Tensor,
     max_calibration_windows: int = 10,
+    score: str = "cohen_d",
+    top_n: int = 3,
+    min_fire_rate: float = 0.05,
 ) -> DiscoveredFeatures:
-    """Score SAE latents on calibration windows to find top features per concept."""
-    from ag_sae.edit import capture_residual
+    """Score SAE latents on calibration windows to find the top features per concept.
 
-    concepts = ["cCRE_PLS", "cCRE_CTCF_only", "cCRE_pELS", "shuffled_dELS"]
-    diffs: dict[str, list[np.ndarray]] = {c: [] for c in concepts}
-    device = sae.channel_scale.device
+    `score="mean_diff"` reproduces the first campaign's choice exactly.
+    """
+    if score not in SCORES:
+        raise ValueError(f"unknown score {score!r}; expected one of {SCORES}")
+    contrasts = {c: ConceptContrast() for c in CONCEPT_COLUMNS}
+    fired_bins, seen_bins = None, 0
 
     with torch.no_grad():
         for window in calibration_windows[:max_calibration_windows]:
             chrom, start, end = window["chrom"], int(window["start"]), int(window["end"])
             num_bins = (end - start) // tap.bin_bp
-            seq = window_sequence(fasta_path, chrom, start, end)
-            input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
-
             bins = annotations.loc[
                 (annotations.chrom == chrom)
                 & (annotations.bin_start >= start) & (annotations.bin_start < end)
             ].sort_values("bin_start").reset_index(drop=True)
+            codes = _window_codes(sae, model, tap, fasta_path, window)
 
-            # Only the part of the model before the tap runs.
-            acts = capture_residual(model, int(tap.key), input_tensor)
-            raw = acts[0].float()
-            codes, _ = sae.encode_codes(raw)
-
-            for c in concepts:
-                col = c
-                if c not in bins.columns and c == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
-                    col = "cCRE_CTCF-only"
-                if col not in bins.columns:
+            for c in CONCEPT_COLUMNS:
+                col = _concept_column(bins, c)
+                if col is None:
                     continue
-
                 pos_mask, observed_mask = map_annotation_column_to_grid(bins, col, start, num_bins, tap.bin_bp)
-                neg_mask = observed_mask & ~pos_mask
-                if pos_mask.sum() > 0 and neg_mask.sum() > 0:
-                    pos = codes[pos_mask].mean(dim=0).detach().cpu().numpy()
-                    neg = codes[neg_mask].mean(dim=0).detach().cpu().numpy()
-                    diffs[c].append(pos - neg)
+                contrasts[c].add(codes, pos_mask, observed_mask & ~pos_mask)
+            # Firing rate on the bins the triad edits, which is where a null
+            # feature must fire as often as the concept feature to be a fair
+            # comparison (a genome-wide rate says little about cCRE bins).
+            edited = edited_bins_mask(bins, start, num_bins, tap.bin_bp)
+            if edited.any():
+                rows = codes[torch.as_tensor(edited, device=codes.device)]
+                fired = (rows > 0).sum(0).cpu().numpy().astype(np.int64)
+                fired_bins = fired if fired_bins is None else fired_bins + fired
+                seen_bins += int(edited.sum())
+            del codes
 
-            del input_tensor, acts, raw, codes
-
-    discovered: dict[str, int] = {}
-    for c in concepts:
-        if len(diffs[c]) > 0:
-            avg_diff = np.mean(diffs[c], axis=0)
-            discovered[c] = int(np.argmax(avg_diff))
-        else:
+    ranked: dict[str, tuple[int, ...]] = {}
+    scores: dict[str, tuple[float, ...]] = {}
+    near_top: set[int] = set()
+    for c in CONCEPT_COLUMNS:
+        if contrasts[c].empty:
             raise RuntimeError(
                 f"[Feature Discovery] No contrastive bins found in calibration windows for concept '{c}'. "
-                "Cannot reliably identify latent feature without contrast."
-            )
+                "Cannot reliably identify latent feature without contrast.")
+        values = contrasts[c].score(score, min_fire_rate)
+        if not np.isfinite(values).any():
+            raise RuntimeError(f"[Feature Discovery] no feature fires on {min_fire_rate:.0%} of the "
+                               f"'{c}' bins; lower min_fire_rate")
+        # Stable sort: ties keep the lowest ID, as np.argmax did.
+        order = np.argsort(-values, kind="stable")[:max(1, top_n)]
+        order = [int(i) for i in order if np.isfinite(values[i])]
+        ranked[c] = tuple(order)
+        if c != "shuffled_dELS":
+            # Strong runners-up of any real concept are not null features.
+            near_top |= {int(i) for i in np.argsort(-values, kind="stable")[:NEAR_TOP]
+                         if np.isfinite(values[i])}
+        scores[c] = tuple(float(values[i]) for i in order)
 
     cleanup_gpu()
     return DiscoveredFeatures(
-        promoter_feature_id=discovered["cCRE_PLS"],
-        insulator_feature_id=discovered["cCRE_CTCF_only"],
-        enhancer_feature_id=discovered["cCRE_pELS"],
-        shuffled_control_feature_id=discovered["shuffled_dELS"],
+        promoter_feature_id=ranked["cCRE_PLS"][0],
+        insulator_feature_id=ranked["cCRE_CTCF_only"][0],
+        enhancer_feature_id=ranked["cCRE_pELS"][0],
+        shuffled_control_feature_id=ranked["shuffled_dELS"][0],
+        ranked=ranked, scores=scores, score=score,
+        firing_rate=None if fired_bins is None else fired_bins / max(seen_bins, 1),
+        near_top=tuple(sorted(near_top)),
     )
+
+
+def matched_null_pools(features: DiscoveredFeatures, top_n: int, pool_size: int = 50) -> dict[str, list[int]]:
+    """Per concept, the `pool_size` features whose firing rate is closest to its feature's.
+
+    A single "control" feature is one draw; the pilot showed it is not null
+    (its ablation moved ChIP-TF). A pool of firing-rate-matched features gives
+    a null distribution instead: a concept feature is specific only if it
+    beats features that fire as often. Every concept's top-n features are
+    excluded from every pool, and so are every real concept's NEAR_TOP best
+    features and features that never fired. Rates are on the edited bins.
+    """
+    if features.firing_rate is None:
+        raise ValueError("matched nulls need the firing rates from discover_concept_features")
+    rate = np.asarray(features.firing_rate, dtype=np.float64)
+    taken = {f for _name, (feat, col) in features.as_dict().items() for f in features.top(col, top_n)}
+    taken |= set(features.near_top)
+    eligible = np.array([i for i in range(len(rate)) if i not in taken and rate[i] > 0])
+    if len(eligible) == 0:
+        raise ValueError("no eligible null features")
+    pools = {}
+    for name, (feat, _col) in features.as_dict().items():
+        if rate[feat] <= 0:
+            raise ValueError(f"{name} feature {feat} never fires on the edited calibration bins; "
+                             "no firing-rate match is possible")
+        gap = np.abs(np.log(rate[eligible] + 1e-9) - np.log(rate[feat] + 1e-9))
+        order = np.argsort(gap, kind="stable")[:pool_size]
+        pools[name] = [int(i) for i in eligible[order]]
+    return pools
+
+
+def draw_null_features(pool: Sequence[int], k: int, seed: int, window_index: int,
+                       concept_index: int) -> list[int]:
+    """`k` distinct features from a pool, reproducible per (seed, window, concept)."""
+    rng = np.random.default_rng([int(seed), int(window_index), int(concept_index)])
+    return [int(f) for f in rng.choice(np.asarray(pool), size=min(k, len(pool)), replace=False)]
+
+
+#: how evaluation windows are picked from a fold's test split
+WINDOW_SAMPLINGS: tuple[str, ...] = ("random", "first")
+
+
+def evaluation_windows(manifest: pd.DataFrame, n: int, sampling: str = "random",
+                       seed: int = 2026) -> list[dict]:
+    """The fold's evaluation windows: the same for every layer and seed of the fold.
+
+    "first" is the first campaign's: the first `n` test windows in manifest
+    order, which cluster on one or two chromosomes. "random" draws `n` test
+    windows uniformly (fixed seed), so they spread over the held-out regions
+    of every chromosome, and returns them in genome order.
+    """
+    test = manifest.loc[manifest.split == "test"]
+    if sampling == "first":
+        rows = test.head(n)
+    elif sampling == "random":
+        rows = test.sample(n=min(n, len(test)), random_state=seed).sort_values(["chrom", "win_start"])
+    else:
+        raise ValueError(f"unknown window sampling {sampling!r}; expected one of {WINDOW_SAMPLINGS}")
+    return [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)} for r in rows.itertuples()]
+
+
+def split_windows(manifest: pd.DataFrame, protocol: "Protocol",
+                  windows: list[dict] | None = None, n_calibration: int = 10) -> tuple[list[dict], list[dict]]:
+    """(evaluation windows, calibration windows) of a fold; the same for every layer and seed.
+
+    Evaluation windows are `windows` when given (a plan), else
+    evaluation_windows(). Calibration windows - which choose the features and
+    the injection dose - are test windows that do not overlap any evaluation
+    window: under v2 a fixed-seed random draw, under legacy the first ones in
+    manifest order (compared by exact key, as the first campaign did).
+    """
+    if windows is None:
+        windows = evaluation_windows(manifest, protocol.n_windows, protocol.window_sampling,
+                                     protocol.window_seed)
+    keys = {(w["chrom"], int(w["start"]), int(w["end"])) for w in windows}
+
+    def overlaps(chrom: str, start: int, end: int) -> bool:
+        if protocol.name == "legacy":
+            return (chrom, start, end) in keys
+        return any(w["chrom"] == chrom and start < int(w["end"]) and int(w["start"]) < end for w in windows)
+
+    candidates = [{"chrom": r.chrom, "start": int(r.win_start), "end": int(r.win_end)}
+                  for r in manifest.loc[manifest.split == "test"].itertuples()
+                  if not overlaps(r.chrom, int(r.win_start), int(r.win_end))]
+    if not candidates:
+        raise RuntimeError("no test windows left for calibration outside the evaluation windows")
+    if protocol.window_sampling == "random":
+        pick = np.random.default_rng(protocol.window_seed + 1).permutation(len(candidates))[:n_calibration]
+        return windows, [candidates[i] for i in sorted(pick)]
+    return windows, candidates[:n_calibration]
+
+
+def feature_dose(
+    sae: Any,
+    model: Any,
+    tap: Any,
+    windows: list[dict],
+    fasta_path: Path,
+    feature: int,
+    quantile: float = 0.99,
+    max_windows: int = 10,
+) -> float:
+    """A feature's natural 'strongly on' level: a quantile of its non-zero values.
+
+    Taken over every bin of the (calibration) windows. Injecting a fixed
+    level such as 5.0 means a different thing for every feature; this level
+    is in the feature's own units, so 1x is a value the feature really
+    reaches and multiples of it give a dose-response curve.
+    """
+    values = []
+    with torch.no_grad():
+        for window in windows[:max_windows]:
+            column = _window_codes(sae, model, tap, fasta_path, window)[:, int(feature)]
+            values.append(column[column > 0].float().cpu().numpy())
+    fired = np.concatenate(values) if values else np.empty(0)
+    if fired.size == 0:
+        raise ValueError(f"feature {feature} never fires in {len(values)} windows; no natural dose")
+    return float(np.quantile(fired, quantile))
 
 
 def read_head_summaries(output: dict, label: str, arrays: dict[str, np.ndarray]) -> None:
@@ -348,6 +613,65 @@ def read_head_summaries(output: dict, label: str, arrays: dict[str, np.ndarray])
         arrays[f"{head}_{label}"] = tensor.detach().float().cpu().numpy().mean(axis=-1)
 
 
+#: per-window delta fields of the triad, under each feature or joint entry
+TRIAD_METHODS: dict[str, tuple[str, str]] = {
+    # field name: (condition-name suffix, condition it is compared with)
+    "heads": ("", "reconstruction"),               # first campaign: x -> SAE(x) - a_i d_i
+    "heads_error_preserving": ("_ep", "original"),  # x -> x - a_i d_i, error kept
+}
+
+
+def _head_deltas(arrays: dict[str, np.ndarray], label: str, baseline: str,
+                 eval_mask: np.ndarray, intervention_mask: np.ndarray) -> dict[str, dict]:
+    has_concept_bins = bool(eval_mask.any())
+    out = {}
+    for head in ALL_HEADS:
+        delta = arrays[f"{head}_{label}"] - arrays[f"{head}_{baseline}"]
+
+        def on_concept(values):
+            return float(values[eval_mask].mean()) if has_concept_bins else None
+
+        out[head] = {
+            "delta_on_concept": on_concept(delta),
+            "delta_on_all_regulatory": float(delta[intervention_mask].mean()) if intervention_mask.any() else 0.0,
+            "has_concept_bins": has_concept_bins,
+            # The signal the change is measured against, so effects can be
+            # put on a common scale across heads (relative change, log ratio).
+            "baseline_on_concept": on_concept(arrays[f"{head}_{baseline}"]),
+            "original_on_concept": on_concept(arrays[f"{head}_original"]),
+        }
+    return out
+
+
+def _minus_null(concept: dict[str, dict], nulls: list[dict[str, dict]]) -> dict[str, dict]:
+    """Per head, a window's concept delta minus the mean of its null deltas."""
+    out = {}
+    for head in ALL_HEADS:
+        c = concept[head]["delta_on_concept"]
+        values = [n[head]["delta_on_concept"] for n in nulls if n[head]["delta_on_concept"] is not None]
+        out[head] = {"delta_on_concept": None if c is None or not values else c - float(np.mean(values))}
+    return out
+
+
+def _summarize_heads(per_window: list[dict]) -> dict[str, dict]:
+    """Paired statistics per head over windows; `per_window` holds `_head_deltas` results."""
+    stats: dict[str, dict] = {}
+    for head in ALL_HEADS:
+        deltas = np.array([w[head]["delta_on_concept"] for w in per_window
+                           if w[head]["delta_on_concept"] is not None], dtype=np.float64)
+        if len(deltas) >= 2:
+            stats[head] = compute_paired_statistics(deltas).to_dict()
+        else:
+            stats[head] = {
+                "mean_delta": float(np.mean(deltas)) if len(deltas) == 1 else 0.0,
+                "median_delta": float(np.median(deltas)) if len(deltas) == 1 else 0.0,
+                "t_stat": 0.0, "t_p": 1.0, "wilcoxon_w": 0.0, "wilcoxon_p": 1.0,
+                "pct_negative": 0.0,
+            }
+        stats[head]["n_measured_windows"] = len(deltas)
+    return stats
+
+
 def run_triad_ablation(
     sae: Any,
     model: Any,
@@ -359,11 +683,32 @@ def run_triad_ablation(
     organism: torch.Tensor,
     out_dir: Path,
     max_batch: int = 3,
+    top_n: int = 3,
+    null_per_window: int = 0,
+    null_pool_size: int = 50,
+    null_seed: int = 0,
 ) -> tuple[list[dict], dict[str, Any]]:
-    """Execute Regulatory Triad Double-Dissociation ablation across test windows."""
+    """Execute Regulatory Triad Double-Dissociation ablation across test windows.
+
+    With `null_per_window` > 0, each window also ablates (error-preserving)
+    that many features drawn per concept from a firing-rate-matched pool
+    (matched_null_pools), so every concept is compared with features that
+    fire as often, on the same bins of the same window; across windows the
+    draws build a null distribution over features. "concept_minus_null" is the
+    per-window paired difference.
+
+    Every concept's feature is ablated two ways (TRIAD_METHODS): through the
+    SAE reconstruction, as in the first campaign, and error-preserving, which
+    removes only the feature's own contribution from the real stream. When
+    discovery ranked more than one feature for a concept, its top `top_n` are
+    also ablated together (error-preserving), since a cleaner dictionary can
+    split one concept over several features.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = sae.channel_scale.device
     target_classes = features.as_dict()
+    joint = {cname: features.top(col, top_n) for cname, (_feat, col) in target_classes.items()}
+    joint = {cname: ids for cname, ids in joint.items() if len(ids) > 1}
+    pools = matched_null_pools(features, top_n, null_pool_size) if null_per_window > 0 else {}
 
     window_results: list[dict] = []
     t_start = time.time()
@@ -378,32 +723,33 @@ def run_triad_ablation(
             & (annotations.bin_start >= start) & (annotations.bin_start < end)
         ].sort_values("bin_start").reset_index(drop=True)
 
-        intervention_mask = np.zeros(num_bins, dtype=bool)
-        if "cCRE_any" in bins.columns:
-            pos, _ = map_annotation_column_to_grid(bins, "cCRE_any", start, num_bins, tap.bin_bp)
-            intervention_mask |= pos
-        elif "cCRE_PLS" in bins.columns:
-            pos, _ = map_annotation_column_to_grid(bins, "cCRE_PLS", start, num_bins, tap.bin_bp)
-            intervention_mask |= pos
-
-        if "shuffled_dELS" in bins.columns:
-            pos, _ = map_annotation_column_to_grid(bins, "shuffled_dELS", start, num_bins, tap.bin_bp)
-            intervention_mask |= pos
-
+        intervention_mask = edited_bins_mask(bins, start, num_bins, tap.bin_bp)
         selected_bins = np.flatnonzero(intervention_mask)
         if len(selected_bins) == 0:
             selected_bins = np.array([num_bins // 2])
 
         seq = window_sequence(fasta_path, chrom, start, end)
-        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
+        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(sae.channel_scale.device)
 
-        # Original, reconstruction and one ablation per class, batched into
-        # ceil(6 / max_batch) forwards instead of six (plus no capture pass).
         conditions = [Condition("original"),
                       Condition("reconstruction", 0, selected_bins, sae_edit(sae, "reconstruction"))]
-        conditions += [Condition(f"ablate_{cname}", 0, selected_bins,
-                                 sae_edit(sae, f"ablate_{cname}", zero_feature(feat)))
-                       for cname, (feat, _col) in target_classes.items()]
+        for cname, (feat, _col) in target_classes.items():
+            conditions.append(Condition(f"ablate_{cname}", 0, selected_bins,
+                                        sae_edit(sae, f"ablate_{cname}", zero_feature(feat))))
+            conditions.append(Condition(f"ablate_{cname}_ep", 0, selected_bins,
+                                        sae_edit(sae, f"ablate_{cname}_ep", zero_feature(feat),
+                                                 preserve_error=True)))
+        for cname, ids in joint.items():
+            conditions.append(Condition(f"joint_{cname}_ep", 0, selected_bins,
+                                        sae_edit(sae, f"joint_{cname}_ep", zero_features(ids),
+                                                 preserve_error=True)))
+        nulls = {cname: draw_null_features(pool, null_per_window, null_seed, wi, ci)
+                 for ci, (cname, pool) in enumerate(pools.items())}
+        for cname, drawn in nulls.items():
+            for j, null_feat in enumerate(drawn):
+                conditions.append(Condition(f"null_{cname}_{j}_ep", 0, selected_bins,
+                                            sae_edit(sae, f"null_{cname}_{j}_ep", zero_feature(null_feat),
+                                                     preserve_error=True)))
         memo: dict = {}
         profiles = run_conditions(model, int(tap.key), input_tensor, conditions,
                                   track_mean_profile(ALL_HEADS), heads=ALL_HEADS,
@@ -414,77 +760,78 @@ def run_triad_ablation(
         codes = memo["reconstruction"]
 
         win_data: dict[str, Any] = {
-            "window_index": wi, "chrom": chrom, "start": start, "features": {}
+            "window_index": wi, "chrom": chrom, "start": start, "features": {}, "joint": {},
+            "null": {}, "edit_norms": memo.get("edit_norms", {}),
         }
 
-        # Effects of each class's ablation
         for cname, (feat, track_col) in target_classes.items():
-            active_mask = (codes[:, feat] > 0).cpu().numpy()
-            fired_count = int(active_mask.sum())
-
-            actual_col = track_col
-            if track_col not in bins.columns and track_col == "cCRE_CTCF_only" and "cCRE_CTCF-only" in bins.columns:
-                actual_col = "cCRE_CTCF-only"
-
-            if actual_col in bins.columns:
-                elem_pos, _ = map_annotation_column_to_grid(bins, actual_col, start, num_bins, tap.bin_bp)
-                elem_mask = elem_pos
+            col = _concept_column(bins, track_col)
+            if col is not None:
+                elem_mask, _ = map_annotation_column_to_grid(bins, col, start, num_bins, tap.bin_bp)
             else:
                 elem_mask = intervention_mask.copy()
-
-            win_data["features"][cname] = {
-                "feature_id": feat, "fired_bins": fired_count, "heads": {}
-            }
-
             eval_mask = (elem_mask & intervention_mask) if (elem_mask & intervention_mask).any() else elem_mask
-            has_concept_bins = bool(eval_mask.any())
-            for head in ALL_HEADS:
-                recon = arrays[f"{head}_reconstruction"]
-                abl = arrays[f"{head}_ablate_{cname}"]
-                delta = abl - recon
-                win_data["features"][cname]["heads"][head] = {
-                    "delta_on_concept": float(delta[eval_mask].mean()) if has_concept_bins else None,
-                    "delta_on_all_regulatory": float(delta[intervention_mask].mean()) if intervention_mask.any() else 0.0,
-                    "has_concept_bins": has_concept_bins,
+
+            entry: dict[str, Any] = {"feature_id": feat,
+                                     "fired_bins": int((codes[:, feat] > 0).sum())}
+            for field_name, (suffix, baseline) in TRIAD_METHODS.items():
+                entry[field_name] = _head_deltas(arrays, f"ablate_{cname}{suffix}", baseline,
+                                                 eval_mask, intervention_mask)
+            win_data["features"][cname] = entry
+            if cname in joint:
+                win_data["joint"][cname] = {
+                    "feature_ids": list(joint[cname]),
+                    "heads_error_preserving": _head_deltas(arrays, f"joint_{cname}_ep", "original",
+                                                           eval_mask, intervention_mask),
                 }
+            if cname in nulls:
+                win_data["null"][cname] = [
+                    {"feature_id": null_feat,
+                     "fired_bins": int((codes[:, null_feat] > 0).sum()),
+                     "heads_error_preserving": _head_deltas(arrays, f"null_{cname}_{j}_ep", "original",
+                                                            eval_mask, intervention_mask)}
+                    for j, null_feat in enumerate(nulls[cname])]
 
         window_results.append(win_data)
         elapsed = time.time() - t0
-        p_atac = win_data["features"]["PLS_Promoter"]["heads"]["atac"]["delta_on_concept"]
-        c_tf = win_data["features"]["CTCF_Insulator"]["heads"]["chip_tf"]["delta_on_concept"]
-        p_str = f"{p_atac:+.4f}" if p_atac is not None else "N/A"
-        c_str = f"{c_tf:+.4f}" if c_tf is not None else "N/A"
+        def shown(cname, head):
+            values = [win_data["features"][cname][f][head]["delta_on_concept"] for f in TRIAD_METHODS]
+            return "/".join("N/A" if v is None else f"{v:+.4f}" for v in values)
         if (wi + 1) % 5 == 0 or wi == 0:
-            print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {p_str} | CTCF TF: {c_str} ({elapsed:.1f}s)", flush=True)
+            print(f"  [Ablation {wi+1:02d}/{len(windows)}] {chrom}:{start} | PLS ATAC: {shown('PLS_Promoter', 'atac')} "
+                  f"| CTCF TF: {shown('CTCF_Insulator', 'chip_tf')} (reconstruction/error-preserving, "
+                  f"{elapsed:.1f}s)", flush=True)
 
         del input_tensor, arrays, codes, memo, profiles
 
     _atomic_write_json(out_dir / "triad_40windows_results.json", window_results)
 
     summary_stats: dict[str, dict[str, Any]] = {}
-    for cname, (feat, track_col) in target_classes.items():
-        summary_stats[cname] = {"feature_id": feat, "heads": {}}
-        for head in ALL_HEADS:
-            deltas = np.array([
-                w["features"][cname]["heads"][head]["delta_on_concept"]
-                for w in window_results
-                if w["features"][cname]["heads"][head]["delta_on_concept"] is not None
-            ], dtype=np.float64)
-            if len(deltas) >= 2:
-                stats_summary = compute_paired_statistics(deltas)
-                summary_stats[cname]["heads"][head] = stats_summary.to_dict()
-                summary_stats[cname]["heads"][head]["n_measured_windows"] = len(deltas)
-            else:
-                summary_stats[cname]["heads"][head] = {
-                    "mean_delta": float(np.mean(deltas)) if len(deltas) == 1 else 0.0,
-                    "median_delta": float(np.median(deltas)) if len(deltas) == 1 else 0.0,
-                    "t_stat": 0.0,
-                    "t_p": 1.0,
-                    "wilcoxon_w": 0.0,
-                    "wilcoxon_p": 1.0,
-                    "pct_negative": 0.0,
-                    "n_measured_windows": len(deltas),
-                }
+    for cname, (feat, _col) in target_classes.items():
+        summary_stats[cname] = {"feature_id": feat}
+        for field_name in TRIAD_METHODS:
+            summary_stats[cname][field_name] = _summarize_heads(
+                [w["features"][cname][field_name] for w in window_results])
+        if cname in joint:
+            shared = {other: sorted(set(joint[cname]) & set(ids)) for other, ids in joint.items()
+                      if other != cname and set(joint[cname]) & set(ids)}
+            summary_stats[cname]["joint"] = {
+                "feature_ids": list(joint[cname]),
+                # Features also in another concept's set blur the joint dissociation.
+                "shared_with": shared,
+                "heads_error_preserving": _summarize_heads(
+                    [w["joint"][cname]["heads_error_preserving"] for w in window_results]),
+            }
+        if cname in pools:
+            null_entries = [n["heads_error_preserving"] for w in window_results for n in w["null"][cname]]
+            summary_stats[cname]["null"] = {
+                "pool": pools[cname], "per_window": null_per_window,
+                "heads_error_preserving": _summarize_heads(null_entries),
+                "concept_minus_null": _summarize_heads([
+                    _minus_null(w["features"][cname]["heads_error_preserving"],
+                                [n["heads_error_preserving"] for n in w["null"][cname]])
+                    for w in window_results]),
+            }
 
     _atomic_write_json(out_dir / "regulatory_triad_summary.json", summary_stats)
     print(f"Ablation complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'regulatory_triad_summary.json'}")
@@ -512,29 +859,44 @@ def match_control_norm(
     return matched, {"target_l2": target_norm, "control_before_l2": control_norm, "scale": ratio}
 
 
+#: how an injection raises a feature: "clamp" up to a level (first campaign),
+#: or "add" a fixed amount (the same edit for every gene)
+INJECTION_MODES: tuple[str, ...] = ("add", "clamp")
+
+
 def matched_control_edit(sae: Any, target: int, control: int, target_level: float,
-                         control_level: float):
+                         control_level: float, *, preserve_error: bool = False,
+                         flag: str = "unmeasurable", mode: str = "clamp"):
     """Row edit for the injection control, dose-matched to the target in L2.
 
-    Clamps `control` up to control_level, then rescales the change from the SAE
-    reconstruction to the L2 size of the change that clamping `target` up to
-    target_level makes at the same row (match_control_norm). If either change
-    is ~0 the row is left at its reconstruction and the reason is stored as
-    memo["unmeasurable"], so the caller can drop the gene.
+    Raises `control` (mode "clamp": up to control_level; "add": by
+    control_level), then rescales the change from the SAE reconstruction to
+    the L2 size of the change the same edit of `target` by target_level makes
+    at the same row (match_control_norm). If either change is ~0 the row is
+    left unchanged and the reason is stored as memo[flag], so the caller can
+    drop the gene. With `preserve_error` the matched change is added to the
+    real rows instead of to their reconstruction.
     """
+    if mode not in INJECTION_MODES:
+        raise ValueError(f"unknown injection mode {mode!r}; expected one of {INJECTION_MODES}")
+
+    def raised(codes, feature, level):
+        out = codes.clone()
+        out[:, feature] = (torch.clamp_min(codes[:, feature], level) if mode == "clamp"
+                           else codes[:, feature] + level)
+        return out
+
     def edit(rows: torch.Tensor, memo: dict) -> torch.Tensor:
         codes, params = sae.encode_codes(rows)
-        target_codes, control_codes = codes.clone(), codes.clone()
-        target_codes[:, target] = torch.clamp_min(codes[:, target], target_level)
-        control_codes[:, control] = torch.clamp_min(codes[:, control], control_level)
+        target_codes, control_codes = raised(codes, target, target_level), raised(codes, control, control_level)
         base = sae.decode_codes(codes, params)
         try:
             matched, _ = match_control_norm(base[None], sae.decode_codes(target_codes, params)[None],
                                             sae.decode_codes(control_codes, params)[None], 0)
         except ValueError as err:
-            memo["unmeasurable"] = str(err)
-            return base
-        return matched[0]
+            memo[flag] = str(err)
+            return rows if preserve_error else base
+        return rows + (matched[0] - base) if preserve_error else matched[0]
     return edit
 
 
@@ -779,19 +1141,20 @@ def eligible_genes(
     return eligible
 
 
-def summarize_gene_effects(readouts: dict[str, np.ndarray], tracks: dict) -> dict:
+def summarize_gene_effects(readouts: dict[str, np.ndarray], tracks: dict, *,
+                           target: str = "target", control: str = "control",
+                           baseline: str = "reconstruction") -> dict:
     """Compute per-modality paired difference and log2 fold change across tracks."""
     summary = {}
     for head in ("rna_seq", "cage", "procap"):
-        original = readouts[f"{head}_original"]
-        baseline = readouts[f"{head}_reconstruction"]
-        target = readouts[f"{head}_target"]
-        control = readouts[f"{head}_control"]
+        base = readouts[f"{head}_{baseline}"]
+        t = readouts[f"{head}_{target}"]
+        c = readouts[f"{head}_{control}"]
 
         offset = 0.001 if head == "rna_seq" else 1.0
-        target_lfc = np.log2((target + offset) / (baseline + offset))
-        control_lfc = np.log2((control + offset) / (baseline + offset))
-        diff = target - control
+        target_lfc = np.log2((t + offset) / (base + offset))
+        control_lfc = np.log2((c + offset) / (base + offset))
+        diff = t - c
 
         summary[head] = {
             "n_tracks": len(tracks[head]),
@@ -834,6 +1197,37 @@ def extract_transcriptional_readout(
         return tensor[:, indices].mean(dim=0).cpu().numpy().astype(np.float32)
 
 
+def dose_tag(multiplier: float) -> str:
+    """Condition suffix of a dose multiplier: 1.0 -> 'x1', 0.5 -> 'x0.5'."""
+    return f"x{float(multiplier):g}"
+
+
+def _inside_any(chrom: str, position: int, windows: Sequence[dict]) -> bool:
+    return any(w["chrom"] == chrom and int(w["start"]) <= position < int(w["end"]) for w in windows)
+
+
+def _modality_stats(measured: list[dict]) -> dict[str, dict]:
+    stats = {}
+    for m in TRANSCRIPTIONAL_HEADS:
+        if not measured:
+            stats[m] = {"mean_paired_difference": 0.0, "median_paired_difference": 0.0,
+                        "t_stat": 0.0, "t_p_value": 1.0, "wilcoxon_w": 0.0, "wilcoxon_p_value": 1.0,
+                        "fraction_target_greater_than_control": 0.0}
+            continue
+        diffs = np.array([g[m]["paired_difference"] for g in measured])
+        s = compute_paired_statistics(diffs)
+        stats[m] = {
+            "mean_paired_difference": s.mean_delta,
+            "median_paired_difference": s.median_delta,
+            "t_stat": s.t_statistic,
+            "t_p_value": s.t_p_value,
+            "wilcoxon_w": s.wilcoxon_w,
+            "wilcoxon_p_value": s.wilcoxon_p_value,
+            "fraction_target_greater_than_control": float(np.mean(diffs > 0)),
+        }
+    return stats
+
+
 def run_gene_injection_cohort(
     sae: Any,
     model: Any,
@@ -848,15 +1242,51 @@ def run_gene_injection_cohort(
     out_dir: Path,
     cache_dir: Path | None = None,
     max_batch: int = 4,
+    dose: float | None = None,
+    dose_multipliers: Sequence[float] = (1.0,),
+    preserve_error: bool = False,
+    dose_source: str = "fixed",
+    injection: str = "clamp",
+    exclude_windows: Sequence[dict] = (),
 ) -> tuple[list[dict], dict[str, Any]]:
-    """Execute MANE Select Gene-TSS injection across eligible protein-coding genes."""
+    """Execute MANE Select Gene-TSS injection across eligible protein-coding genes.
+
+    For every multiplier the promoter feature is raised at the TSS bin by
+    ``multiplier * dose`` (injection "add") or up to it ("clamp", the first
+    campaign), each with its own L2-matched control. Clamping does nothing
+    where the feature already exceeds the level, so its genes and its real
+    code change differ per dose; adding is the same edit for every gene.
+    `dose` is the feature's natural level (feature_dose); None keeps the first
+    campaign's fixed 5.0. With `preserve_error` the edits keep the SAE's
+    reconstruction error and are compared with the unedited model instead of
+    the reconstruction.
+
+    The 1x dose is the primary result ("status", "effects", "modalities").
+    Every dose is under "doses" / "dose_response", and "dose_response_common"
+    repeats the curve on the genes measured at every dose. Genes whose TSS
+    lies in one of `exclude_windows` (the calibration windows that chose the
+    feature and its dose) are left out.
+    """
+    multipliers = tuple(float(m) for m in dose_multipliers)
+    tags = {dose_tag(m): m for m in multipliers}
+    if 1.0 not in multipliers or any(m <= 0 for m in multipliers) or len(tags) != len(multipliers):
+        raise ValueError(f"dose multipliers must be positive, distinct and include 1.0, got {dose_multipliers}")
+    if injection not in INJECTION_MODES:
+        raise ValueError(f"unknown injection mode {injection!r}; expected one of {INJECTION_MODES}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    device = sae.channel_scale.device
-    candidates = eligible_genes(gtf_path, manifest, annotations, cache_dir=cache_dir)
+    eligible = eligible_genes(gtf_path, manifest, annotations, cache_dir=cache_dir)
+    candidates = [g for g in eligible if not _inside_any(g["chrom"], int(g["tss0"]), exclude_windows)]
     n_genes = len(candidates)
 
-    target_level = float(sae.core.activation(torch.tensor([5.0])).item()) if hasattr(sae.core, "activation") else 5.0
-    control_level = target_level * 0.7
+    if dose is None:
+        dose = float(sae.core.activation(torch.tensor([5.0])).item()) if hasattr(sae.core, "activation") else 5.0
+    if not np.isfinite(dose) or dose <= 0:
+        raise ValueError(f"injection dose must be positive, got {dose}")
+    levels = {tag: m * dose for tag, m in tags.items()}
+    primary = dose_tag(1.0)
+    baseline = "original" if preserve_error else "reconstruction"
+    ctrl_feat = control_feature_id if control_feature_id != promoter_feature_id else (promoter_feature_id + 1)
+    raise_target = add_to_feature if injection == "add" else clamp_min_feature
 
     gene_results: list[dict] = []
     t_start = time.time()
@@ -868,24 +1298,21 @@ def run_gene_injection_cohort(
         tss_bin = (tss0 - start) // 128
         tracks = select_tracks(strand)
 
-        mask = np.zeros(8192, dtype=bool)
-        mask[tss_bin] = True
-
         seq = window_sequence(fasta_path, chrom, start, end)
-        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(device)
+        input_tensor = torch.from_numpy(sequence_to_onehot(seq).astype(np.float32))[None].to(sae.channel_scale.device)
 
-        # Original, reconstruction, target injection and the L2-matched control,
-        # in one batched forward (the first campaign used four, plus a capture).
-        ctrl_feat = control_feature_id if control_feature_id != promoter_feature_id else (promoter_feature_id + 1)
+        # Original, reconstruction, and a target injection with its L2-matched
+        # control per dose, batched max_batch conditions per forward.
         tss = [int(tss_bin)]
-        conditions = [
-            Condition("original"),
-            Condition("reconstruction", 0, tss, sae_edit(sae, "reconstruction")),
-            Condition("target", 0, tss, sae_edit(sae, "target",
-                                                 clamp_min_feature(promoter_feature_id, target_level))),
-            Condition("control", 0, tss, matched_control_edit(
-                sae, promoter_feature_id, ctrl_feat, target_level, control_level)),
-        ]
+        conditions = [Condition("original"),
+                      Condition("reconstruction", 0, tss, sae_edit(sae, "reconstruction"))]
+        for tag, level in levels.items():
+            conditions.append(Condition(f"target_{tag}", 0, tss, sae_edit(
+                sae, f"target_{tag}", raise_target(promoter_feature_id, level),
+                preserve_error=preserve_error)))
+            conditions.append(Condition(f"control_{tag}", 0, tss, matched_control_edit(
+                sae, promoter_feature_id, ctrl_feat, level, 0.7 * level,
+                preserve_error=preserve_error, flag=f"unmeasurable_{tag}", mode=injection)))
         track_indices = {head: [int(t["index"]) for t in tracks[head]] for head in TRANSCRIPTIONAL_HEADS}
 
         def gene_readout(outputs, b, gene=gene):
@@ -895,64 +1322,169 @@ def run_gene_injection_cohort(
         memo: dict = {}
         per_condition = run_conditions(model, int(tap.key), input_tensor, conditions, gene_readout,
                                        heads=TRANSCRIPTIONAL_HEADS, max_batch=max_batch, memo=memo)
-        if "unmeasurable" in memo:
-            gene_results.append({"rank": rank, "gene_name": gene_name, "status": "unmeasurable",
-                                 "reason": memo["unmeasurable"]})
-            continue
         readouts: dict[str, np.ndarray] = {f"{head}_{label}": values[head]
                                            for label, values in per_condition.items()
                                            for head in TRANSCRIPTIONAL_HEADS}
+        a0 = float(memo["reconstruction"][0, promoter_feature_id])
+        doses: dict[str, dict] = {}
+        for tag, level in levels.items():
+            code_change = level if injection == "add" else max(level - a0, 0.0)
+            entry = {"level": level, "code_change": code_change,
+                     "edit_norms": {k: memo.get("edit_norms", {}).get(f"{k}_{tag}")
+                                    for k in ("target", "control")}}
+            reason = memo.get(f"unmeasurable_{tag}")
+            if reason is not None:
+                entry.update(status="unmeasurable", reason=reason)
+            else:
+                entry.update(status="measured", effects=summarize_gene_effects(
+                    readouts, tracks, target=f"target_{tag}", control=f"control_{tag}", baseline=baseline))
+            doses[tag] = entry
 
-        effects = summarize_gene_effects(readouts, tracks)
         np.savez_compressed(out_dir / f"gene_rank_{rank:02d}_{gene_name}.npz", **readouts)
-        gene_results.append({
-            "rank": rank, "gene_name": gene_name, "chrom": chrom, "tss0": tss0,
-            "status": "measured", "effects": effects,
-        })
+        record = {"rank": rank, "gene_name": gene_name, "chrom": chrom, "tss0": tss0,
+                  "feature_at_tss": a0,
+                  "control_at_tss": float(memo["reconstruction"][0, ctrl_feat]),
+                  "status": doses[primary]["status"], "doses": doses}
+        if doses[primary]["status"] == "measured":
+            record["effects"] = doses[primary]["effects"]
+        else:
+            record["reason"] = doses[primary]["reason"]
+        gene_results.append(record)
 
-        if (rank + 1) % 5 == 0 or rank == 0:
-            rna_d = effects["rna_seq"]["paired_difference"]
-            pro_d = effects["procap"]["paired_difference"]
+        if ((rank + 1) % 5 == 0 or rank == 0) and "effects" in record:
+            rna_d = record["effects"]["rna_seq"]["paired_difference"]
+            pro_d = record["effects"]["procap"]["paired_difference"]
             print(f"  [Gene {rank+1:02d}/{n_genes}] {gene_name:<10} | RNA Diff: {rna_d:+.4f} | PRO-cap Diff: {pro_d:+.4f} ({time.time()-tg0:.1f}s)", flush=True)
 
         del input_tensor, readouts, per_condition, memo
 
     _atomic_write_json(out_dir / "gene_cohort_results.json", gene_results)
 
-    measured_genes = [g for g in gene_results if g.get("status") == "measured"]
-    gene_stats: dict[str, Any] = {
-        "n_total_eligible": n_genes, "n_measured": len(measured_genes), "modalities": {}
-    }
+    def curve(genes: list[dict]) -> dict:
+        out = {}
+        for tag, level in levels.items():
+            measured = [g["doses"][tag]["effects"] for g in genes if g["doses"][tag]["status"] == "measured"]
+            out[tag] = {"multiplier": tags[tag], "level": level,
+                        "n_measured": len(measured), "modalities": _modality_stats(measured)}
+        return out
 
-    if len(measured_genes) == 0:
-        for m in TRANSCRIPTIONAL_HEADS:
-            gene_stats["modalities"][m] = {
-                "mean_paired_difference": 0.0,
-                "median_paired_difference": 0.0,
-                "t_stat": 0.0,
-                "t_p_value": 1.0,
-                "wilcoxon_w": 0.0,
-                "wilcoxon_p_value": 1.0,
-                "fraction_target_greater_than_control": 0.0,
-            }
-    else:
-        for m in TRANSCRIPTIONAL_HEADS:
-            diffs = [g["effects"][m]["paired_difference"] for g in measured_genes]
-            stats_summary = compute_paired_statistics(np.array(diffs))
-            gene_stats["modalities"][m] = {
-                "mean_paired_difference": stats_summary.mean_delta,
-                "median_paired_difference": stats_summary.median_delta,
-                "t_stat": stats_summary.t_statistic,
-                "t_p_value": stats_summary.t_p_value,
-                "wilcoxon_w": stats_summary.wilcoxon_w,
-                "wilcoxon_p_value": stats_summary.wilcoxon_p_value,
-                "fraction_target_greater_than_control": float(np.mean(np.array(diffs) > 0)),
-            }
+    dose_response = curve(gene_results)
+    common = [g for g in gene_results if all(d["status"] == "measured" for d in g["doses"].values())]
+    gene_stats: dict[str, Any] = {
+        "n_total_eligible": n_genes,
+        "n_excluded_calibration": len(eligible) - n_genes,
+        "n_measured": dose_response[primary]["n_measured"],
+        "dose": {"level": dose, "source": dose_source, "multipliers": list(multipliers),
+                 "injection": injection},
+        "baseline": baseline,
+        "promoter_feature_id": int(promoter_feature_id),
+        "control_feature_id": int(ctrl_feat),
+        "modalities": dose_response[primary]["modalities"],
+        "dose_response": dose_response,
+        "n_measured_every_dose": len(common),
+        "dose_response_common": curve(common),
+    }
 
     _atomic_write_json(out_dir / "gene_level_statistical_summary.json", gene_stats)
     print(f"Gene cohort complete in {time.time()-t_start:.1f}s! Saved to {out_dir / 'gene_level_statistical_summary.json'}")
     cleanup_gpu()
     return gene_results, gene_stats
+
+
+@dataclass(frozen=True)
+class Protocol:
+    """How a configuration's features are chosen and edited.
+
+    The defaults are the v2 protocol; `Protocol.legacy()` is the first
+    campaign's (largest window-averaged mean difference, one feature, fixed
+    dose 5.0 clamped in, edits through the reconstruction), so old SAEs can
+    be re-run as they were. The triad always reports both edit methods
+    (TRIAD_METHODS); under v2 the error-preserving one is primary.
+    """
+
+    name: str = "v2"
+    score: str = "cohen_d"
+    top_n: int = 3
+    min_fire_rate: float = 0.05
+    fixed_dose: float | None = None          # None: the feature's natural level
+    dose_quantile: float = 0.99
+    dose_multipliers: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+    injection: str = "add"
+    preserve_error: bool = True               # injection edits
+    n_windows: int = 40
+    window_sampling: str = "random"           # "first": the first campaign's
+    window_seed: int = 2026
+    null_per_window: int = 1                  # matched null features per concept and window
+    null_pool_size: int = 50
+
+    def __post_init__(self):
+        if self.name not in PROTOCOLS:
+            raise ValueError(f"unknown protocol {self.name!r}; expected one of {PROTOCOLS}")
+        if self.score not in SCORES:
+            raise ValueError(f"unknown score {self.score!r}; expected one of {SCORES}")
+        if self.injection not in INJECTION_MODES:
+            raise ValueError(f"unknown injection {self.injection!r}; expected one of {INJECTION_MODES}")
+        if self.window_sampling not in WINDOW_SAMPLINGS:
+            raise ValueError(f"unknown window sampling {self.window_sampling!r}")
+        if self.n_windows < 1 or self.null_per_window < 0 or self.null_pool_size < 1 or self.top_n < 1:
+            raise ValueError("n_windows, null_pool_size and top_n must be >= 1, null_per_window >= 0")
+
+    @classmethod
+    def legacy(cls, **overrides) -> "Protocol":
+        base = dict(name="legacy", score="mean_diff", top_n=1, min_fire_rate=0.0, fixed_dose=5.0,
+                    dose_multipliers=(1.0,), injection="clamp", preserve_error=False,
+                    window_sampling="first", null_per_window=0)
+        base.update(overrides)
+        return cls(**base)
+
+    @classmethod
+    def named(cls, name: str, **overrides) -> "Protocol":
+        return cls.legacy(**overrides) if name == "legacy" else cls(name=name, **overrides)
+
+    @property
+    def triad_primary(self) -> str:
+        return "heads" if self.name == "legacy" else "heads_error_preserving"
+
+    def to_json(self) -> dict:
+        from dataclasses import asdict
+        return {k: list(v) if isinstance(v, tuple) else v for k, v in asdict(self).items()}
+
+
+#: protocol names; results of each go to their own folders (protocol_suffix)
+PROTOCOLS: tuple[str, ...] = ("v2", "legacy")
+
+
+def protocol_suffix(protocol: str) -> str:
+    """Folder suffix of a protocol: none for legacy (the first campaign's folders)."""
+    if protocol not in PROTOCOLS:
+        raise ValueError(f"unknown protocol {protocol!r}; expected one of {PROTOCOLS}")
+    return "" if protocol == "legacy" else f"_protocol_{protocol}"
+
+
+def campaign_name(sae_pool: str, protocol: str = "legacy") -> str:
+    """analysis_runs folder (and Drive folder) of a pool's triad/injection results.
+
+    campaign_matrix, campaign_matrix_<pool>, or with _protocol_v2 appended,
+    so a v2 run never finds, skips over or mixes with the first campaign's
+    files.
+    """
+    base = "campaign_matrix" if sae_pool == "sae" else f"campaign_matrix_{sae_pool}"
+    return base + protocol_suffix(protocol)
+
+
+def check_resumable(out_dir: Path, protocol: Protocol) -> None:
+    """Refuse to continue a configuration folder written under another protocol."""
+    record = out_dir / "feature_discovery.json"
+    done = [f.name for f in (out_dir / "regulatory_triad_summary.json",
+                             out_dir / "gene_level_statistical_summary.json") if is_valid_json_file(f)]
+    if record.is_file():
+        stored = json.loads(record.read_text()).get("protocol")
+        if stored != protocol.to_json():
+            raise RuntimeError(f"{out_dir} was run with protocol {stored}, not {protocol.to_json()}; "
+                               "use another --out")
+    elif done and protocol != Protocol.legacy():
+        raise RuntimeError(f"{out_dir} holds {done} from an unrecorded (first-campaign) protocol; "
+                           "use another --out")
 
 
 def run_single_configuration(
@@ -969,8 +1501,10 @@ def run_single_configuration(
     plan_path: Path | None = None,
     cache_dir: Path | None = None,
     max_batch: int = 3,
+    protocol: Protocol | None = None,
 ) -> None:
     """Orchestrate evaluation for a single (fold, layer, seed) configuration."""
+    protocol = protocol or Protocol()
     from alphagenome_pytorch import AlphaGenome
     from alphagenome_pytorch.config import DtypePolicy
     from ag_sae.extract import TAPS
@@ -1005,24 +1539,10 @@ def run_single_configuration(
             raise ValueError(f"None of the windows in plan {plan_path} belong to the '{fold}' test split.")
         windows = valid_windows
     else:
-        windows = [
-            {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-            for row in manifest.loc[manifest.split == "test"].head(40).itertuples()
-        ]
-
-    # Use strictly disjoint calibration windows for feature discovery to guarantee zero data leakage
-    # Calibration windows are drawn from manifest windows that are strictly disjoint from the evaluation cohort (windows)
-    eval_keys = {(w["chrom"], int(w["start"]), int(w["end"])) for w in windows}
-    # annotation_main.parquet provides annotations for the test partition; select disjoint test windows outside eval cohort
-    test_slice = manifest.loc[manifest.split == "test"]
-    calib_candidates = [
-        {"chrom": row.chrom, "start": int(row.win_start), "end": int(row.win_end)}
-        for row in test_slice.itertuples()
-        if (row.chrom, int(row.win_start), int(row.win_end)) not in eval_keys
-    ]
-    if not calib_candidates:
-        raise RuntimeError("Zero data leakage violated: no disjoint calibration windows available outside evaluation cohort.")
-    calib_windows = calib_candidates[:10]
+        windows = None
+    windows, calib_windows = split_windows(manifest, protocol, windows)
+    # Fail before the models are loaded if this folder belongs to another protocol.
+    check_resumable(out_dir, protocol)
 
     # 2. Load models
     print(f"Loading SAE from {sae_path}...")
@@ -1035,7 +1555,24 @@ def run_single_configuration(
     organism = torch.tensor([0], device="cuda")
 
     # 3. Dynamic Feature Discovery
-    features = discover_concept_features(sae, model, tap, calib_windows, annotations, fasta_path, organism)
+    features = discover_concept_features(sae, model, tap, calib_windows, annotations, fasta_path, organism,
+                                         score=protocol.score, top_n=protocol.top_n,
+                                         min_fire_rate=protocol.min_fire_rate)
+    if protocol.fixed_dose is not None:
+        dose, dose_source = float(protocol.fixed_dose), "fixed"
+    else:
+        dose = feature_dose(sae, model, tap, calib_windows, fasta_path, features.promoter_feature_id,
+                            quantile=protocol.dose_quantile)
+        dose_source = f"q{protocol.dose_quantile:g} of non-zero values in {len(calib_windows)} calibration windows"
+    _atomic_write_json(out_dir / "feature_discovery.json", {
+        **features.to_json(), "protocol": protocol.to_json(),
+        "triad_primary_method": protocol.triad_primary,
+        "evaluation_windows": windows,
+        "injection_dose": {"feature_id": features.promoter_feature_id, "level": dose, "source": dose_source},
+        "calibration_windows": calib_windows,
+    })
+    print(f"[Discovery] {features.to_json()['primary']} (score {protocol.score}); "
+          f"injection dose {dose:.3f} ({dose_source})")
 
     # 4. Regulatory Triad Ablation
     triad_summary_file = out_dir / "regulatory_triad_summary.json"
@@ -1043,7 +1580,9 @@ def run_single_configuration(
         print(f"[Ablation] Found valid {triad_summary_file}, skipping Part 1...")
     else:
         run_triad_ablation(sae, model, tap, windows, annotations, features, fasta_path, organism, out_dir,
-                           max_batch=max_batch)
+                           max_batch=max_batch, top_n=protocol.top_n,
+                           null_per_window=protocol.null_per_window,
+                           null_pool_size=protocol.null_pool_size, null_seed=protocol.window_seed)
 
     # 5. Gene-TSS Injection Cohort
     gene_summary_file = out_dir / "gene_level_statistical_summary.json"
@@ -1055,10 +1594,53 @@ def run_single_configuration(
             gtf_path=gtf_path, fasta_path=fasta_path,
             promoter_feature_id=features.promoter_feature_id,
             control_feature_id=features.insulator_feature_id,
-            organism=organism, out_dir=out_dir, cache_dir=cache_dir, max_batch=max_batch
+            organism=organism, out_dir=out_dir, cache_dir=cache_dir, max_batch=max_batch,
+            dose=dose, dose_multipliers=protocol.dose_multipliers,
+            preserve_error=protocol.preserve_error, dose_source=dose_source,
+            injection=protocol.injection,
+            # Genes in the windows that chose the feature and its dose would leak.
+            exclude_windows=() if protocol.name == "legacy" else calib_windows,
         )
 
     print(f"\nConfiguration {fold} {layer} {seed} completed successfully in {time.time()-t_start:.1f}s!\n")
+
+
+def add_protocol_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--protocol", choices=list(PROTOCOLS), default="v2",
+                        help="v2: within-window Cohen's d top-3, natural additive dose-response, "
+                             "error-preserving injection; legacy: the first campaign's choices")
+    parser.add_argument("--score", choices=list(SCORES), default=None, help="override the protocol's score")
+    parser.add_argument("--top-n", type=int, default=None, help="features ranked (and jointly ablated) per concept")
+    parser.add_argument("--min-fire-rate", type=float, default=None,
+                        help="cohen_d: minimum share of positive bins a feature must fire on")
+    dose = parser.add_mutually_exclusive_group()
+    dose.add_argument("--fixed-dose", type=float, default=None,
+                      help="inject this level instead of the feature's natural one")
+    dose.add_argument("--natural-dose", action="store_true",
+                      help="use the feature's natural level (the v2 default) under any protocol")
+    parser.add_argument("--dose-quantile", type=float, default=None)
+    parser.add_argument("--dose-multipliers", type=float, nargs="+", default=None,
+                        help="multiples of the dose to inject; must include 1")
+    parser.add_argument("--injection", choices=list(INJECTION_MODES), default=None)
+    parser.add_argument("--preserve-error", action=argparse.BooleanOptionalAction, default=None,
+                        help="injection edits keep the SAE reconstruction error")
+    parser.add_argument("--n-windows", type=int, default=None, help="evaluation windows per fold")
+    parser.add_argument("--null-per-window", type=int, default=None,
+                        help="matched null features per concept and window (0: none)")
+
+
+def protocol_from_args(args: argparse.Namespace) -> Protocol:
+    overrides = {"score": args.score, "top_n": args.top_n, "min_fire_rate": args.min_fire_rate,
+                 "fixed_dose": args.fixed_dose, "dose_quantile": args.dose_quantile,
+                 "dose_multipliers": tuple(args.dose_multipliers) if args.dose_multipliers else None,
+                 "injection": args.injection, "preserve_error": args.preserve_error,
+                 "n_windows": args.n_windows, "null_per_window": args.null_per_window}
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    if args.natural_dose:
+        overrides["fixed_dose"] = None
+    if args.protocol == "legacy" and overrides.get("score") == "cohen_d" and args.min_fire_rate is None:
+        overrides["min_fire_rate"] = Protocol().min_fire_rate   # keep the guard cohen_d needs
+    return Protocol.named(args.protocol, **overrides)
 
 
 def cmd_intervene(argv: list[str] | None = None) -> int:
@@ -1080,12 +1662,14 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
                         help="SAE directory under /mnt/ag (sae, sae_k64, sae_v2, ...)")
     parser.add_argument("--max-batch", type=int, default=3,
                         help="conditions per forward; 3-4 on an 80 GB A100, 1-2 on 40 GB")
+    add_protocol_arguments(parser)
 
     args = parser.parse_args(argv)
+    protocol = protocol_from_args(args)
     fold_num = args.fold.replace("fold", "")
     weights = args.weights or Path(f"/mnt/ag/weights/model_fold_{fold_num}.safetensors")
     sae = args.sae or Path(f"/mnt/ag/{args.sae_pool}/{args.fold}/{args.layer}_{args.seed}/best.pt")
-    campaign = "campaign_matrix" if args.sae_pool == "sae" else f"campaign_matrix_{args.sae_pool}"
+    campaign = campaign_name(args.sae_pool, protocol.name)
     out = args.out or Path(f"/mnt/ag/analysis_runs/{campaign}/{args.fold}_{args.layer}_{args.seed}")
 
     manifest_candidates = [
@@ -1103,14 +1687,18 @@ def cmd_intervene(argv: list[str] | None = None) -> int:
 
     fold_plan = Path(f"/mnt/ag/analysis-code-a1f31ce/tmp/local_plan_{args.fold}.json")
     default_plan = Path("/mnt/ag/analysis-code-a1f31ce/tmp/local_plan.json")
-    plan = args.plan or (fold_plan if fold_plan.is_file() else (default_plan if default_plan.is_file() and args.fold == "fold1" else None))
+    # The first campaign's hand-made plans apply to it only; v2 picks its own windows.
+    auto_plan = (fold_plan if fold_plan.is_file() else
+                 (default_plan if default_plan.is_file() and args.fold == "fold1" else None))
+    plan = args.plan or (auto_plan if protocol.name == "legacy" else None)
 
     run_single_configuration(
         fold=args.fold, layer=args.layer, seed=args.seed,
         weights_path=weights, sae_path=sae,
         manifest_path=manifest, annotations_path=annotations,
         fasta_path=args.fasta, gtf_path=args.gtf,
-        out_dir=out, plan_path=plan, cache_dir=args.cache_dir, max_batch=args.max_batch
+        out_dir=out, plan_path=plan, cache_dir=args.cache_dir, max_batch=args.max_batch,
+        protocol=protocol,
     )
     return 0
 
